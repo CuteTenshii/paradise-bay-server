@@ -2,7 +2,7 @@
 
 In 2015, King/Z2 made the "Paradise Bay" game which they discontinued in 2018, with servers closing. At the time I was playing this game. I wanted to re-play it but couldn't as the servers closed.
 
-Fortunately, the servers URLs is stored in a `game-info.json` array in the Appx package (on Windows).
+Fortunately, the servers URLs are just in an array in the `game-info.json` file, which is stored in the Appx package (on Windows).
 
 ## Patching
 
