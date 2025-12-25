@@ -23,6 +23,7 @@ const (
 	TransactionAccepted      Command = "transactionAccepted"
 	RequestDocumentFragments Command = "requestDocumentFragments"
 	RequestDocumentsResponse Command = "requestDocumentsResponse"
+	GetFriendPlayers         Command = "getFriendPlayers2"
 )
 
 type ClientMessage struct {
@@ -51,7 +52,13 @@ type ConnectionState struct {
 	mu      sync.Mutex
 }
 
+type TransactionContext struct {
+	TransactionID int
+	TimelineID    int
+}
+
 var state ConnectionState
+var transactions = make(map[int]*TransactionContext)
 
 func startSocket(port int) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -115,7 +122,8 @@ func handleMessage(conn net.Conn) {
 		if event.Cmd == Connect {
 			state.nextReq = 0
 			err = sendMessage(conn, Connect, map[string]interface{}{
-				"sessionCookie": "abc123def45678901234567890",
+				"resumeSessionCookie": "8d0ed094-4f5c-417e-bd29-489ce818e570",
+				"uit":                 "8d0ed094-4f5c-417e-bd29-489ce818e570",
 				// List of URLs to open in the browser (why?)
 				"urls": []string{},
 				"pushCmdPairs": []struct {
@@ -132,16 +140,15 @@ func handleMessage(conn net.Conn) {
 				"cid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 				"kid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 
+				"allowsFastConnect":     true,
 				"fastConnectIsPossible": true,
 				"fastConnectDataResponse": map[string]interface{}{
-					"documents": []struct {
-					}{},
 				},
 				"loginResponse": map[string]interface{}{
-					"uuid":                  "8d0ed094-4f5c-417e-bd29-489ce818e570",
-					"fastConnectIsPossible": true,
-
-					"fastConnectDataResponse": map[string]interface{}{},
+					"uuid":             "8d0ed094-4f5c-417e-bd29-489ce818e570",
+					"requestedCid":     "8d0ed094-4f5c-417e-bd29-489ce818e570",
+					"bestAlias":        "alias",
+					"currencyBalances": map[string]interface{}{},
 				},
 			}, event.Service)
 		} else if event.Cmd == Reconnect {
@@ -151,10 +158,15 @@ func handleMessage(conn net.Conn) {
 		} else if event.Cmd == Heartbeat {
 			err = sendMessage(conn, Heartbeat, nil, event.Service)
 		} else if event.Cmd == OnNewTransactionContext {
+			// Append transaction
+			transactionId := int(event.Data.(map[string]interface{})["tcId"].(float64))
+			timelineId := int(event.Data.(map[string]interface{})["timelineId"].(float64))
+			transactions[transactionId] = &TransactionContext{TransactionID: transactionId, TimelineID: timelineId}
+
 			err = sendLuaMessage(conn, TransactionAccepted, TransactionAccepted, map[string]interface{}{
-				"tcId":          int(event.Data.(map[string]interface{})["tcId"].(float64)),
-				"transactionId": int(event.Data.(map[string]interface{})["tcId"].(float64)),
-				"timelineId":    int(event.Data.(map[string]interface{})["timelineId"].(float64)),
+				"tcId":          transactionId,
+				"transactionId": transactionId,
+				"timelineId":    timelineId,
 				"blobStoreDelta": map[string]interface{}{
 					"insert": []any{},
 					"update": []any{},
@@ -162,13 +174,22 @@ func handleMessage(conn net.Conn) {
 				},
 			})
 		} else if event.Cmd == RequestDocumentFragments {
+			// TODO: make structs
+			transactionId := int(event.Data.(map[string]interface{})["message"].(map[string]interface{})["tcId"].(float64))
+			transaction := transactions[transactionId]
+			timelineId := transaction.TimelineID
+
 			err = sendLuaMessage(conn, TransactionAccepted, RequestDocumentsResponse, map[string]interface{}{
-				"tcId":           int(event.Data.(map[string]interface{})["tcId"].(float64)),
-				"transactionId":  int(event.Data.(map[string]interface{})["tcId"].(float64)),
-				"timelineId":     int(event.Data.(map[string]interface{})["timelineId"].(float64)),
+				"tcId":           transactionId,
+				"transactionId":  transactionId,
+				"timelineId":     timelineId,
 				"blobStoreDelta": []any{},
 				"updates":        []any{},
 			})
+		} else if event.Cmd == GetFriendPlayers {
+			err = sendMessage(conn, GetFriendPlayers, map[string]interface{}{
+				"players": []interface{}{},
+			}, event.Service)
 		} else {
 			err = sendMessage(conn, event.Cmd, nil, event.Service)
 		}
