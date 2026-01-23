@@ -18,7 +18,13 @@ Fortunately, the servers URLs are just in an array in the `game-info.json` file,
 2. Delete `AppxSignature.p7x` (required otherwise Windows won't install the package) 
 3. Open `game-info.json`, search for `"Server List":`
 4. Before `"http://tk1-win.z2live.com/"`, add `"http://localhost:8080"` (with the quotes)
-5. Open PowerShell, cd to the extracted appx and run this:
+
+### Installing the game
+
+1. Enable "Developer Mode":
+   - **Windows 10:** idk 
+   - **Windows 11:** System > For developers > Check "Developer Mode"
+2. Open PowerShell, cd to the extracted appx and run this:
    ```shell
    Add-AppxPackage -Register ".\AppxManifest.xml"
    ```
