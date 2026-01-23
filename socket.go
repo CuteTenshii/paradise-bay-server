@@ -60,12 +60,13 @@ type TransactionContext struct {
 var state ConnectionState
 var transactions = make(map[int]*TransactionContext)
 
-func startSocket(port int) {
+func StartSocket(port int) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		panic(err)
 	}
 	defer listener.Close()
+	fmt.Printf("Socket started on 127.0.0.1:%d\n", port)
 
 	for {
 		conn, err := listener.Accept()
@@ -140,10 +141,9 @@ func handleMessage(conn net.Conn) {
 				"cid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 				"kid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 
-				"allowsFastConnect":     true,
-				"fastConnectIsPossible": true,
-				"fastConnectDataResponse": map[string]interface{}{
-				},
+				"allowsFastConnect":       true,
+				"fastConnectIsPossible":   true,
+				"fastConnectDataResponse": map[string]interface{}{},
 				"loginResponse": map[string]interface{}{
 					"uuid":             "8d0ed094-4f5c-417e-bd29-489ce818e570",
 					"requestedCid":     "8d0ed094-4f5c-417e-bd29-489ce818e570",
