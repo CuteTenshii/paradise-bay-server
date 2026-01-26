@@ -17,17 +17,16 @@ func StartHttp(port int) {
 				"game_server": map[string]interface{}{
 					// You'll probably want to change the IP to localhost. In my case, I'm using a Windows VM to test
 					// this, so I need to bind the IP for the VMware network to use my host
-					"uri": "zp://172.16.148.1:3301/",
+					"uri": "zp://127.0.0.1:3301/",
 				},
 			},
 		}
 
 		data, _ := json.Marshal(servers)
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("content-type", "application/json")
 		w.WriteHeader(http.StatusOK)
-
-		if err := json.NewEncoder(w).Encode(data); err != nil {
-			log.Println("failed to write response:", err)
+		if _, err := w.Write(data); err != nil {
+			log.Fatal(err)
 		}
 	})
 
@@ -44,7 +43,7 @@ func StartHttp(port int) {
 
 		// Write response
 		response := map[string]interface{}{"success": true}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("content-type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
 		if err := json.NewEncoder(w).Encode(response); err != nil {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ const (
 	RequestDocumentFragments Command = "requestDocumentFragments"
 	RequestDocumentsResponse Command = "requestDocumentsResponse"
 	GetFriendPlayers         Command = "getFriendPlayers2"
+	ValidateOnDemandFiles    Command = "validateOnDemandFiles"
 )
 
 type ClientMessage struct {
@@ -110,7 +112,7 @@ func handleMessage(conn net.Conn) {
 			continue
 		}
 
-		event := ClientMessage{
+		event := ServerMessage{
 			Ack:     mapData["ack"].(float64),
 			Cmd:     Command(mapData["cmd"].(string)),
 			Data:    mapData["data"],
@@ -118,38 +120,45 @@ func handleMessage(conn net.Conn) {
 			Service: mapData["to"].(string),
 		}
 
-		log.Printf("Received message: cmd=%s, req=%1f, to=%s, data=%s", event.Cmd, state.nextReq, event.Service, event.Data)
+		log.Printf("Received message: cmd=%s, req=%1.0f, to=%s, data=%s", event.Cmd, state.nextReq, event.Service, event.Data)
 
 		if event.Cmd == Connect {
 			state.nextReq = 0
+
+			files := map[string]string{}
+			filesNames := event.Data.(map[string]interface{})["fileToSha1"].(map[string]interface{})
+			for name := range filesNames {
+				files[name] = filesNames[name].(string)
+			}
+
 			err = sendMessage(conn, Connect, map[string]interface{}{
-				"resumeSessionCookie": "8d0ed094-4f5c-417e-bd29-489ce818e570",
-				"uit":                 "8d0ed094-4f5c-417e-bd29-489ce818e570",
 				// List of URLs to open in the browser (why?)
 				"urls": []string{},
 				"pushCmdPairs": []struct {
 					Name string `json:"name"`
 					Data any    `json:"data"`
 				}{},
+				"bundleID": "king.com.ParadiseBay",
 				"sessionConfig": map[string]interface{}{
 					"adsUseProductionUnits": false,
 					"serverTimeMillis":      time.Now().UnixMilli(),
 					"serverTimeDelta":       0,
-					"bundleID":              "king.com.ParadiseBay",
-					"accountName":           "accountName",
 				},
 				"cid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 				"kid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 
-				"allowsFastConnect":       true,
-				"fastConnectIsPossible":   true,
-				"fastConnectDataResponse": map[string]interface{}{},
+				"allowsFastConnect": true,
 				"loginResponse": map[string]interface{}{
 					"uuid":             "8d0ed094-4f5c-417e-bd29-489ce818e570",
 					"requestedCid":     "8d0ed094-4f5c-417e-bd29-489ce818e570",
-					"bestAlias":        "alias",
+					"bestAlias":        "Tenshii",
 					"currencyBalances": map[string]interface{}{},
+					"currencyEvent":    map[string]interface{}{},
+					"promoList":        []interface{}{},
 				},
+				"promoList":  []interface{}{},
+				"filesToOTA": []interface{}{},
+				"fileToSha1": files,
 			}, event.Service)
 		} else if event.Cmd == Reconnect {
 			err = sendMessage(conn, Reconnect, map[string]interface{}{
@@ -188,7 +197,28 @@ func handleMessage(conn net.Conn) {
 			})
 		} else if event.Cmd == GetFriendPlayers {
 			err = sendMessage(conn, GetFriendPlayers, map[string]interface{}{
-				"players": []interface{}{},
+				"players": []map[string]interface{}{
+					{
+						"friend": map[string]interface{}{
+							"uuid":         "8d0ed095-4f5c-417e-bd29-489ce818e570",
+							"metadata":     map[string]interface{}{},
+							"gameCenterId": "",
+							"googlePlayId": "",
+							"facebookId":   "",
+						},
+					},
+				},
+			}, event.Service)
+		} else if event.Cmd == ValidateOnDemandFiles {
+			files := map[string]string{}
+			filesNames := event.Data.(map[string]interface{})["fileToSha1"].(map[string]interface{})
+			for name := range filesNames {
+				files[name] = fmt.Sprintf("%x", sha1.Sum([]byte(name)))
+			}
+
+			err = sendMessage(conn, ValidateOnDemandFiles, map[string]interface{}{
+				//"data":       []interface{}{},
+				"fileToSha1": files,
 			}, event.Service)
 		} else {
 			err = sendMessage(conn, event.Cmd, nil, event.Service)
@@ -202,7 +232,7 @@ func handleMessage(conn net.Conn) {
 }
 
 func sendMessage(conn net.Conn, cmd Command, data any, service string) error {
-	message := ClientMessage{
+	message := ServerMessage{
 		Ack:     0,
 		Cmd:     cmd,
 		Data:    data,
@@ -250,13 +280,13 @@ func sendLuaMessage(conn net.Conn, cmd Command, actionType Command, data any) er
 	var zlibBuf bytes.Buffer
 	zlibWriter := zlib.NewWriter(&zlibBuf)
 
-	if _, err := zlibWriter.Write([]byte(fmt.Sprintf("%07d", len(jsonBytes)))); err != nil {
+	if _, err = zlibWriter.Write([]byte(fmt.Sprintf("%07d", len(jsonBytes)))); err != nil {
 		return fmt.Errorf("failed to write compressed payload: %w", err)
 	}
-	if _, err := zlibWriter.Write(jsonBytes); err != nil {
+	if _, err = zlibWriter.Write(jsonBytes); err != nil {
 		return fmt.Errorf("failed to write compressed payload: %w", err)
 	}
-	if err := zlibWriter.Close(); err != nil {
+	if err = zlibWriter.Close(); err != nil {
 		return fmt.Errorf("failed to close zlib: %w", err)
 	}
 
