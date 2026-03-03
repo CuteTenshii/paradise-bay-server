@@ -43,10 +43,11 @@ type ServerMessage struct {
 	Ack float64 `json:"ack"`
 	// The command to execute
 	Cmd Command `json:"cmd"`
-	// Data of the message. Can be null
+	// Data of the message. Can be nil
 	Data    any     `json:"data"`
 	Req     float64 `json:"req"`
 	Service string  `json:"to"`
+	Ses     string  `json:"ses"`
 }
 
 type ConnectionState struct {
@@ -238,6 +239,7 @@ func sendMessage(conn net.Conn, cmd Command, data any, service string) error {
 		Data:    data,
 		Req:     state.nextReq,
 		Service: service,
+		Ses:     "session",
 	}
 	jsonBytes, err := json.Marshal(message)
 	if err != nil {
