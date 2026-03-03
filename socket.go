@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
-	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +10,6 @@ import (
 	"net"
 	"reflect"
 	"sync"
-	"time"
 )
 
 type Command string
@@ -29,14 +27,16 @@ const (
 )
 
 type ClientMessage struct {
-	Ack float64 `json:"ack"`
 	// The command to execute
 	Cmd Command `json:"cmd"`
-	// Data of the message. Can be null
-	Data    any     `json:"data"`
-	Req     float64 `json:"req"`
-	Service string  `json:"to"`
-	Type    Command `json:"type"`
+	// Data of the message. Can be nil
+	Data any `json:"data"`
+	// Request ID
+	Request float64 `json:"req"`
+	// Response ID
+	Response float64 `json:"res"`
+	// Session cookie
+	Session string `json:"ses"`
 }
 
 type ServerMessage struct {
@@ -44,10 +44,11 @@ type ServerMessage struct {
 	// The command to execute
 	Cmd Command `json:"cmd"`
 	// Data of the message. Can be nil
-	Data    any     `json:"data"`
-	Req     float64 `json:"req"`
-	Service string  `json:"to"`
-	Ses     string  `json:"ses"`
+	Data any `json:"data"`
+	// Request ID
+	Request float64 `json:"req"`
+	// Service/Namespace
+	Service string `json:"to"`
 }
 
 type ConnectionState struct {
@@ -117,7 +118,7 @@ func handleMessage(conn net.Conn) {
 			Ack:     mapData["ack"].(float64),
 			Cmd:     Command(mapData["cmd"].(string)),
 			Data:    mapData["data"],
-			Req:     mapData["req"].(float64),
+			Request: mapData["req"].(float64),
 			Service: mapData["to"].(string),
 		}
 
@@ -125,7 +126,8 @@ func handleMessage(conn net.Conn) {
 
 		if event.Cmd == Connect {
 			state.nextReq = 0
-
+		}
+		if event.Cmd == Connect || event.Cmd == Reconnect {
 			files := map[string]string{}
 			filesNames := event.Data.(map[string]interface{})["fileToSha1"].(map[string]interface{})
 			for name := range filesNames {
@@ -139,16 +141,9 @@ func handleMessage(conn net.Conn) {
 					Name string `json:"name"`
 					Data any    `json:"data"`
 				}{},
-				"bundleID": "king.com.ParadiseBay",
-				"sessionConfig": map[string]interface{}{
-					"adsUseProductionUnits": false,
-					"serverTimeMillis":      time.Now().UnixMilli(),
-					"serverTimeDelta":       0,
-				},
 				"cid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 				"kid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
 
-				"allowsFastConnect": true,
 				"loginResponse": map[string]interface{}{
 					"uuid":             "8d0ed094-4f5c-417e-bd29-489ce818e570",
 					"requestedCid":     "8d0ed094-4f5c-417e-bd29-489ce818e570",
@@ -157,13 +152,11 @@ func handleMessage(conn net.Conn) {
 					"currencyEvent":    map[string]interface{}{},
 					"promoList":        []interface{}{},
 				},
-				"promoList":  []interface{}{},
 				"filesToOTA": []interface{}{},
 				"fileToSha1": files,
-			}, event.Service)
-		} else if event.Cmd == Reconnect {
-			err = sendMessage(conn, Reconnect, map[string]interface{}{
-				//
+
+				"zenSettings":         map[string]interface{}{},
+				"connectResponseData": []any{},
 			}, event.Service)
 		} else if event.Cmd == Heartbeat {
 			err = sendMessage(conn, Heartbeat, nil, event.Service)
@@ -214,13 +207,10 @@ func handleMessage(conn net.Conn) {
 			files := map[string]string{}
 			filesNames := event.Data.(map[string]interface{})["fileToSha1"].(map[string]interface{})
 			for name := range filesNames {
-				files[name] = fmt.Sprintf("%x", sha1.Sum([]byte(name)))
+				files[name] = "" //fmt.Sprintf("%x", sha1.Sum([]byte(name)))
 			}
 
-			err = sendMessage(conn, ValidateOnDemandFiles, map[string]interface{}{
-				//"data":       []interface{}{},
-				"fileToSha1": files,
-			}, event.Service)
+			err = sendMessage(conn, ValidateOnDemandFiles, files, event.Service)
 		} else {
 			err = sendMessage(conn, event.Cmd, nil, event.Service)
 		}
@@ -233,13 +223,12 @@ func handleMessage(conn net.Conn) {
 }
 
 func sendMessage(conn net.Conn, cmd Command, data any, service string) error {
-	message := ServerMessage{
-		Ack:     0,
-		Cmd:     cmd,
-		Data:    data,
-		Req:     state.nextReq,
-		Service: service,
-		Ses:     "session",
+	message := ClientMessage{
+		Cmd:      cmd,
+		Data:     data,
+		Request:  state.nextReq,
+		Response: state.nextReq,
+		Session:  "session",
 	}
 	jsonBytes, err := json.Marshal(message)
 	if err != nil {
@@ -268,12 +257,10 @@ func sendMessage(conn net.Conn, cmd Command, data any, service string) error {
 func sendLuaMessage(conn net.Conn, cmd Command, actionType Command, data any) error {
 	data.(map[string]interface{})["type"] = cmd
 	message := ClientMessage{
-		Ack:     0,
-		Cmd:     cmd,
-		Type:    actionType,
+		//Cmd: cmd,
+		//Type:    actionType,
 		Data:    map[string]interface{}{"message": data},
-		Req:     state.nextReq,
-		Service: "luas",
+		Request: state.nextReq,
 	}
 	jsonBytes, err := json.Marshal(message)
 	if err != nil {
