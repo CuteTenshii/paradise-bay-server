@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 	"reflect"
-	"sync"
 )
 
 type Command string
@@ -20,10 +19,14 @@ const (
 	Heartbeat                Command = "heartbeat"
 	OnNewTransactionContext  Command = "onNewTransactionContext"
 	TransactionAccepted      Command = "transactionAccepted"
+	RequestDocuments         Command = "requestDocuments"
 	RequestDocumentFragments Command = "requestDocumentFragments"
 	RequestDocumentsResponse Command = "requestDocumentsResponse"
 	GetFriendPlayers         Command = "getFriendPlayers2"
 	ValidateOnDemandFiles    Command = "validateOnDemandFiles"
+	LuaSessionMessage        Command = "luaSessionMessage"
+	Luas                     Command = "luas"
+	GetInAppProducts         Command = "getInAppProducts2"
 )
 
 type ClientMessage struct {
@@ -39,30 +42,16 @@ type ClientMessage struct {
 	Session string `json:"ses"`
 }
 
-type ServerMessage struct {
-	Ack float64 `json:"ack"`
-	// The command to execute
-	Cmd Command `json:"cmd"`
-	// Data of the message. Can be nil
-	Data any `json:"data"`
-	// Request ID
-	Request float64 `json:"req"`
-	// Service/Namespace
-	Service string `json:"to"`
-}
-
-type ConnectionState struct {
-	nextReq float64
-	mu      sync.Mutex
+type LuaMessage struct {
+	Cmd      Command `json:"cmd"`
+	Response float64 `json:"res"`
+	Data     any     `json:"data"`
 }
 
 type TransactionContext struct {
 	TransactionID int
 	TimelineID    int
 }
-
-var state ConnectionState
-var transactions = make(map[int]*TransactionContext)
 
 func StartSocket(port int) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -85,7 +74,10 @@ func StartSocket(port int) {
 func handleMessage(conn net.Conn) {
 	defer conn.Close()
 
-	// Wrap the connection with zlib reader
+	// Per-connection state: strictly incrementing res counter and transaction map
+	nextRes := 0
+	transactions := make(map[int]*TransactionContext)
+
 	zlibReader, err := zlib.NewReader(conn)
 	if err != nil {
 		log.Println("Failed to create zlib reader:", err)
@@ -96,9 +88,8 @@ func handleMessage(conn net.Conn) {
 
 	for {
 		var data any
-		if err := decoder.Decode(&data); err != nil {
+		if err = decoder.Decode(&data); err != nil {
 			if err == io.EOF {
-				// Connection closed, exit gracefully
 				break
 			}
 			log.Println("Error decoding JSON:", err)
@@ -114,174 +105,201 @@ func handleMessage(conn net.Conn) {
 			continue
 		}
 
-		event := ServerMessage{
-			Ack:     mapData["ack"].(float64),
-			Cmd:     Command(mapData["cmd"].(string)),
-			Data:    mapData["data"],
-			Request: mapData["req"].(float64),
-			Service: mapData["to"].(string),
+		cmd := Command(mapData["cmd"].(string))
+		var req float64
+		if r, ok := mapData["req"]; ok && r != nil {
+			req = r.(float64)
+		}
+		msgData := mapData["data"]
+
+		log.Printf("Received message: cmd=%s, req=%.0f, data=%v", cmd, req, msgData)
+
+		if cmd == Connect {
+			nextRes = 0
 		}
 
-		log.Printf("Received message: cmd=%s, req=%1.0f, to=%s, data=%s", event.Cmd, state.nextReq, event.Service, event.Data)
-
-		if event.Cmd == Connect {
-			state.nextReq = 0
-		}
-		if event.Cmd == Connect || event.Cmd == Reconnect {
+		var sendErr error
+		switch cmd {
+		case Connect, Reconnect:
 			files := map[string]string{}
-			filesNames := event.Data.(map[string]interface{})["fileToSha1"].(map[string]interface{})
-			for name := range filesNames {
-				files[name] = filesNames[name].(string)
+			if fd, ok := msgData.(map[string]interface{}); ok {
+				if f2s, ok := fd["fileToSha1"].(map[string]interface{}); ok {
+					for name, v := range f2s {
+						files[name] = v.(string)
+					}
+				}
 			}
-
-			err = sendMessage(conn, Connect, map[string]interface{}{
-				// List of URLs to open in the browser (why?)
-				"urls": []string{},
-				"pushCmdPairs": []struct {
-					Name string `json:"name"`
-					Data any    `json:"data"`
-				}{},
-				"cid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
-				"kid": "8d0ed094-4f5c-417e-bd29-489ce818e570",
-
+			sendErr = sendMessage(conn, &nextRes, Connect, req, map[string]interface{}{
+				"urls":         []string{},
+				"pushCmdPairs": []interface{}{},
+				"cid":          "8d0ed094-4f5c-417e-bd29-489ce818e570",
+				"kid":          "8d0ed094-4f5c-417e-bd29-489ce818e570",
 				"loginResponse": map[string]interface{}{
 					"uuid":             "8d0ed094-4f5c-417e-bd29-489ce818e570",
 					"requestedCid":     "8d0ed094-4f5c-417e-bd29-489ce818e570",
 					"bestAlias":        "Tenshii",
 					"currencyBalances": map[string]interface{}{},
-					"currencyEvent":    map[string]interface{}{},
-					"promoList":        []interface{}{},
 				},
-				"filesToOTA": []interface{}{},
-				"fileToSha1": files,
-
+				"filesToOTA":          []interface{}{},
+				"fileToSha1":          files,
 				"zenSettings":         map[string]interface{}{},
 				"connectResponseData": []any{},
-			}, event.Service)
-		} else if event.Cmd == Heartbeat {
-			err = sendMessage(conn, Heartbeat, nil, event.Service)
-		} else if event.Cmd == OnNewTransactionContext {
-			// Append transaction
-			transactionId := int(event.Data.(map[string]interface{})["tcId"].(float64))
-			timelineId := int(event.Data.(map[string]interface{})["timelineId"].(float64))
-			transactions[transactionId] = &TransactionContext{TransactionID: transactionId, TimelineID: timelineId}
-
-			err = sendLuaMessage(conn, TransactionAccepted, TransactionAccepted, map[string]interface{}{
-				"tcId":          transactionId,
-				"transactionId": transactionId,
-				"timelineId":    timelineId,
-				"blobStoreDelta": map[string]interface{}{
-					"insert": []any{},
-					"update": []any{},
-					"delete": []any{},
-				},
 			})
-		} else if event.Cmd == RequestDocumentFragments {
-			// TODO: make structs
-			transactionId := int(event.Data.(map[string]interface{})["message"].(map[string]interface{})["tcId"].(float64))
-			transaction := transactions[transactionId]
-			timelineId := transaction.TimelineID
-
-			err = sendLuaMessage(conn, TransactionAccepted, RequestDocumentsResponse, map[string]interface{}{
-				"tcId":           transactionId,
-				"transactionId":  transactionId,
-				"timelineId":     timelineId,
-				"blobStoreDelta": []any{},
-				"updates":        []any{},
-			})
-		} else if event.Cmd == GetFriendPlayers {
-			err = sendMessage(conn, GetFriendPlayers, map[string]interface{}{
-				"players": []map[string]interface{}{
-					{
-						"friend": map[string]interface{}{
-							"uuid":         "8d0ed095-4f5c-417e-bd29-489ce818e570",
-							"metadata":     map[string]interface{}{},
-							"gameCenterId": "",
-							"googlePlayId": "",
-							"facebookId":   "",
-						},
-					},
-				},
-			}, event.Service)
-		} else if event.Cmd == ValidateOnDemandFiles {
-			files := map[string]string{}
-			filesNames := event.Data.(map[string]interface{})["fileToSha1"].(map[string]interface{})
-			for name := range filesNames {
-				files[name] = "" //fmt.Sprintf("%x", sha1.Sum([]byte(name)))
+			if sendErr == nil {
+				sendErr = sendLuaMessage(conn, &nextRes, map[string]interface{}{
+					"type":                           "sessionConfiguration",
+					"sendClientBlobsWithTransaction": true,
+				})
 			}
 
-			err = sendMessage(conn, ValidateOnDemandFiles, files, event.Service)
-		} else {
-			err = sendMessage(conn, event.Cmd, nil, event.Service)
-		}
-		if err != nil {
-			log.Println("Failed to send connect message:", err)
+		case Heartbeat:
+			sendErr = sendMessage(conn, &nextRes, Heartbeat, req, nil)
+
+		case OnNewTransactionContext:
+			eventData := msgData.(map[string]interface{})
+			transactionId := int(eventData["tcId"].(float64))
+			timelineId := int(eventData["timelineId"].(float64))
+			transactions[transactionId] = &TransactionContext{
+				TransactionID: transactionId,
+				TimelineID:    timelineId,
+			}
+			sendErr = sendMessage(conn, &nextRes, Luas, req, map[string]interface{}{})
+
+		case RequestDocuments:
+			message := msgData.(map[string]interface{})["message"].(map[string]interface{})
+			transactionId := int(message["tcId"].(float64))
+			if transactions[transactionId] == nil {
+				log.Println("No transaction found:", transactionId)
+				continue
+			}
+
+			blobStoreKeys := message["blobStoreKeys"].([]interface{})
+			updates := make([]map[string]interface{}, 0, len(blobStoreKeys))
+			for _, key := range blobStoreKeys {
+				j, _ := json.Marshal(map[string]interface{}{})
+				updates = append(updates, map[string]interface{}{
+					"documentFragmentId": key.(string),
+					"blobJson":           string(j),
+				})
+			}
+
+			// Push data first, then ack
+			sendErr = sendLuaMessage(conn, &nextRes, map[string]interface{}{
+				"type":          "requestDocumentsResponse",
+				"tcId":          transactionId,
+				"blobStoreKeys": blobStoreKeys,
+				"updates":       updates,
+			})
+			if sendErr == nil {
+				sendErr = sendMessage(conn, &nextRes, Luas, req, map[string]interface{}{})
+			}
+
+		case RequestDocumentFragments:
+			message := msgData.(map[string]interface{})["message"].(map[string]interface{})
+			transactionId := int(message["tcId"].(float64))
+			if transactions[transactionId] == nil {
+				log.Println("No transaction found:", transactionId)
+				continue
+			}
+
+			fragmentIds := message["documentFragmentIds"].([]interface{})
+			updates := make([]map[string]interface{}, 0, len(fragmentIds))
+			for _, id := range fragmentIds {
+				j, _ := json.Marshal(map[string]interface{}{})
+				updates = append(updates, map[string]interface{}{
+					"documentFragmentId": id.(string),
+					"blobJson":           string(j),
+				})
+			}
+
+			// Push data first, then ack
+			sendErr = sendLuaMessage(conn, &nextRes, map[string]interface{}{
+				"type":          "requestDocumentsResponse",
+				"tcId":          transactionId,
+				"blobStoreKeys": fragmentIds,
+				"updates":       updates,
+			})
+			if sendErr == nil {
+				sendErr = sendMessage(conn, &nextRes, Luas, req, map[string]interface{}{})
+			}
+
+		case GetFriendPlayers:
+			sendErr = sendMessage(conn, &nextRes, GetFriendPlayers, req, map[string]interface{}{
+				"friends": []interface{}{},
+				"more":    false,
+			})
+
+		case ValidateOnDemandFiles:
+			files := map[string]string{}
+			if fd, ok := msgData.(map[string]interface{}); ok {
+				if f2s, ok := fd["fileToSha1"].(map[string]interface{}); ok {
+					for name := range f2s {
+						files[name] = ""
+					}
+				}
+			}
+			sendErr = sendMessage(conn, &nextRes, ValidateOnDemandFiles, req, files)
+
+		case GetInAppProducts:
+			sendErr = sendMessage(conn, &nextRes, cmd, req, map[string]interface{}{
+				"products":            []interface{}{},
+				"productsWithBundles": []interface{}{},
+			})
+
+		default:
+			sendErr = sendMessage(conn, &nextRes, cmd, req, nil)
 		}
 
-		state.nextReq++
+		if sendErr != nil {
+			log.Println("Failed to send message:", sendErr)
+		}
 	}
 }
 
-func sendMessage(conn net.Conn, cmd Command, data any, service string) error {
+func sendMessage(conn net.Conn, nextRes *int, cmd Command, req float64, data any) error {
 	message := ClientMessage{
 		Cmd:      cmd,
 		Data:     data,
-		Request:  state.nextReq,
-		Response: state.nextReq,
+		Request:  req,
+		Response: float64(*nextRes),
 		Session:  "session",
 	}
+	*nextRes++
 	jsonBytes, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
+	log.Println("[SENT]", string(jsonBytes))
+	return writeFrame(conn, jsonBytes)
+}
+
+func sendLuaMessage(conn net.Conn, nextRes *int, data any) error {
+	message := LuaMessage{
+		Cmd:      LuaSessionMessage,
+		Response: float64(*nextRes),
+		Data:     data,
+	}
+	*nextRes++
+	jsonBytes, err := json.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+	log.Println("[SENT]", string(jsonBytes))
+	return writeFrame(conn, jsonBytes)
+}
+
+func writeFrame(conn net.Conn, jsonBytes []byte) error {
 	var zlibBuf bytes.Buffer
 	zlibWriter := zlib.NewWriter(&zlibBuf)
-
 	if _, err := zlibWriter.Write([]byte(fmt.Sprintf("%07d", len(jsonBytes)))); err != nil {
-		return fmt.Errorf("failed to write compressed payload: %w", err)
+		return fmt.Errorf("failed to write length prefix: %w", err)
 	}
 	if _, err := zlibWriter.Write(jsonBytes); err != nil {
-		return fmt.Errorf("failed to write compressed payload: %w", err)
+		return fmt.Errorf("failed to write payload: %w", err)
 	}
 	if err := zlibWriter.Close(); err != nil {
 		return fmt.Errorf("failed to close zlib: %w", err)
 	}
-
-	log.Println("[SENT]", string(jsonBytes))
-
-	// Send ZLIB STREAM
-	_, err = conn.Write(zlibBuf.Bytes())
-	return err
-}
-
-func sendLuaMessage(conn net.Conn, cmd Command, actionType Command, data any) error {
-	data.(map[string]interface{})["type"] = cmd
-	message := ClientMessage{
-		//Cmd: cmd,
-		//Type:    actionType,
-		Data:    map[string]interface{}{"message": data},
-		Request: state.nextReq,
-	}
-	jsonBytes, err := json.Marshal(message)
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-	var zlibBuf bytes.Buffer
-	zlibWriter := zlib.NewWriter(&zlibBuf)
-
-	if _, err = zlibWriter.Write([]byte(fmt.Sprintf("%07d", len(jsonBytes)))); err != nil {
-		return fmt.Errorf("failed to write compressed payload: %w", err)
-	}
-	if _, err = zlibWriter.Write(jsonBytes); err != nil {
-		return fmt.Errorf("failed to write compressed payload: %w", err)
-	}
-	if err = zlibWriter.Close(); err != nil {
-		return fmt.Errorf("failed to close zlib: %w", err)
-	}
-
-	log.Println("[SENT]", string(jsonBytes))
-
-	// Send ZLIB STREAM
-	_, err = conn.Write(zlibBuf.Bytes())
+	_, err := conn.Write(zlibBuf.Bytes())
 	return err
 }
