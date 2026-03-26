@@ -35,7 +35,7 @@ func StartSocket(port int, store *Store) {
 		panic(err)
 	}
 	defer listener.Close()
-	fmt.Printf("Socket started on 127.0.0.1:%d\n", port)
+	fmt.Printf("✓ Socket listening on 127.0.0.1:%d\n\nAll good! Launch Paradise Bay from the Start menu and enjoy your island. 🏝️\nThis window can be minimized, keep it running in the background while you play.\n\n", port)
 
 	for {
 		conn, err := listener.Accept()

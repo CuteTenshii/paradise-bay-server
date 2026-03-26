@@ -51,6 +51,6 @@ func StartHttp(port int) {
 		}
 	})
 
-	fmt.Printf("HTTP Server started on 127.0.0.1:%d\n", port)
+	fmt.Printf("✓ HTTP Server started on 127.0.0.1:%d\n", port)
 	http.ListenAndServe(fmt.Sprintf(":%d", port), mux)
 }

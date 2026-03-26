@@ -7,22 +7,23 @@ Fortunately, the servers URLs are just in an array in the `game-info.json` file,
 ![](./screenshot.png)
 The game running on Windows 11 25H2 and being debugged on Visual Studio 2022.
 
-## Patching
+## Usage with the game
 
-### Downloading the `.appx`
+### Downloading the game `.appx`
+
+A `.appx` file is a Microsoft Store package file. Downloading it will allow us to edit its contents.
 
 1. Go to https://store.rg-adguard.net/
 2. Filter by ProductId, search for `9nblggh5l706`
-3. Download `king.com.ParadiseBay_3.9.0.0_x86__kgqvnymyfvs32.appx` (the last file)
-
-### Modifying files
-
-1. Extract the appx using 7-Zip (WinRAR probably works)
-2. Open `game-info.json`, search for `"Server List":`, and replace `"http://tk1-win.z2live.com/"` with `"http://localhost:3300"` (keep the quotes)
+3. Download `king.com.ParadiseBay_3.9.0.0_x86__kgqvnymyfvs32.appx` (the last file) and move it in this folder.
 
 ### Installing the game
 
-1. Enable "Developer Mode":
-   - **Windows 10:** idk 
-   - **Windows 11:** System > For developers > Check "Developer Mode"
+1. Enable "Developer Mode": Go to Settings > System > For developers > Enable "Developer Mode"
 2. Run `install.bat`
+
+If you have any issues while installing or playing the game don't hesitate to [open a GitHub issue](https://github.com/CuteTenshii/paradise-bay-server/issues/new)!!
+
+### Starting the server
+
+You need to install [Go](https://go.dev/dl/) to run it. Then, run `start.bat`.
