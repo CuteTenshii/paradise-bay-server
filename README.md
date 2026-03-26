@@ -4,6 +4,9 @@ In 2015, King/Z2 made the "Paradise Bay" game which they discontinued in 2018, w
 
 Fortunately, the servers URLs are just in an array in the `game-info.json` file, which is stored in the Appx package (on Windows).
 
+![](./screenshot.png)
+The game running on Windows 11 25H2 and being debugged on Visual Studio 2022.
+
 ## Patching
 
 ### Downloading the `.appx`
