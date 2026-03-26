@@ -1,6 +1,5 @@
 package main
 
-type VirtualFragment map[string]string
 type Command string
 
 type Friend struct {

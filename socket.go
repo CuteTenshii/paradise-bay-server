@@ -8,25 +8,8 @@ import (
 	"log"
 	"net"
 	"reflect"
-	"strings"
 	"time"
 )
-
-// Offline fake blobs for VIRTUAL fragment types (mirrors the game's own initialFakes).
-// Key = document type prefix of the fragment blob store key.
-var virtualFragmentFakes = VirtualFragment{
-	"VIRTUAL_PlayerCurrency":  `{"currencyBalances":{"Nanopods2":120000,"Gems":150000},"lifetimeValueDollars":100,"_t":"VirtualPlayerCurrency:v1"}`,
-	"VIRTUAL_PlayerInfo":      `{"bestAlias":"Lieutenant Herta","_t":"VirtualPlayerInfo:v1"}`,
-	"VIRTUAL_PlayerFriends":   `{"friendPlayerViews":{},"_t":"VirtualPlayerFriends:v1"}`,
-	"VIRTUAL_LeaderboardTier": `{"tier":"Tier0","_t":"LeaderboardTierVirtualFragment:v1"}`,
-}
-
-// fakeFriends is the list of players that will appear in the in-game friends list.
-// Add entries here to populate the social panel without needing a real Facebook login.
-// UUID can be any valid UUID-shaped string; Alias is the display name shown in-game.
-var fakeFriends = []Friend{
-	{"11111111-1111-1111-1111-111111111111", "Test Friend", 10},
-}
 
 // friendsInfoBlob returns a serialised FriendsInfoFragment for the given alias/level.
 // The structure mirrors FriendsInfoFragment.init() → {info: getDefaultFriendsInfoView()}.
@@ -46,53 +29,7 @@ func friendsInfoBlob(alias string, level int) string {
 	return string(blob)
 }
 
-// fakeFriendMap is built once at startup for O(1) lookup keyed by UUID.
-var fakeFriendMap = func() map[string]struct {
-	Alias string
-	Level int
-} {
-	m := make(map[string]struct {
-		Alias string
-		Level int
-	}, len(fakeFriends))
-	for _, f := range fakeFriends {
-		m[f.UUID] = struct {
-			Alias string
-			Level int
-		}{f.Alias, f.Level}
-	}
-	return m
-}()
-
-func fakeFragmentBlob(fragmentBlobStoreKey string) string {
-	// Key format: "{documentType}:{fragmentId}:{documentId}"
-	// e.g. "FriendsInfo:friendsInfo:P[11111111-...]"
-	first := strings.Index(fragmentBlobStoreKey, ":")
-	if first == -1 {
-		return ""
-	}
-	docType := fragmentBlobStoreKey[:first]
-
-	if docType == "FriendsInfo" {
-		// Extract UUID from "P[uuid]" at the end of the key.
-		pStart := strings.Index(fragmentBlobStoreKey, "P[")
-		pEnd := strings.LastIndex(fragmentBlobStoreKey, "]")
-		if pStart != -1 && pEnd > pStart {
-			uuid := fragmentBlobStoreKey[pStart+2 : pEnd]
-			if f, ok := fakeFriendMap[uuid]; ok {
-				return friendsInfoBlob(f.Alias, f.Level)
-			}
-		}
-		return ""
-	}
-
-	if fake, ok := virtualFragmentFakes[docType]; ok {
-		return fake
-	}
-	return ""
-}
-
-func StartSocket(port int) {
+func StartSocket(port int, store *Store) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		panic(err)
@@ -106,11 +43,11 @@ func StartSocket(port int) {
 			log.Fatal(err)
 		}
 
-		go handleMessage(conn)
+		go handleMessage(conn, store)
 	}
 }
 
-func handleMessage(conn net.Conn) {
+func handleMessage(conn net.Conn, store *Store) {
 	defer conn.Close()
 
 	// Per-connection state: strictly incrementing res counter and transaction map
@@ -167,6 +104,11 @@ func handleMessage(conn net.Conn) {
 		var sendErr error
 		switch cmd {
 		case Connect:
+			player, playerErr := store.GetPlayer()
+			if playerErr != nil {
+				log.Println("connect: failed to load player:", playerErr)
+				break
+			}
 			files := map[string]string{}
 			if fd, ok := msgData.(map[string]interface{}); ok {
 				if f2s, ok := fd["fileToSha1"].(map[string]interface{}); ok {
@@ -178,12 +120,12 @@ func handleMessage(conn net.Conn) {
 			sendErr = sendMessage(zlibWriter, &nextRes, Connect, req, map[string]interface{}{
 				"urls":         []string{},
 				"pushCmdPairs": []interface{}{},
-				"cid":          "8d0ed094-4f5c-417e-bd29-489ce818e570",
-				"kid":          "8d0ed094-4f5c-417e-bd29-489ce818e570",
+				"cid":          player.UUID,
+				"kid":          player.UUID,
 				"loginResponse": map[string]interface{}{
-					"uuid":             "8d0ed094-4f5c-417e-bd29-489ce818e570",
-					"requestedCid":     "8d0ed094-4f5c-417e-bd29-489ce818e570",
-					"bestAlias":        "Tenshii",
+					"uuid":             player.UUID,
+					"requestedCid":     player.UUID,
+					"bestAlias":        player.Alias,
 					"currencyBalances": map[string]interface{}{},
 				},
 				"filesToOTA":          []interface{}{},
@@ -194,12 +136,7 @@ func handleMessage(conn net.Conn) {
 					"serverTimeMillis": time.Now().UnixMilli(),
 				},
 			})
-			if sendErr == nil {
-				sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
-					"type":                           "sessionConfiguration",
-					"sendClientBlobsWithTransaction": true,
-				})
-			}
+			// sessionConfiguration is sent in OnNewTransactionContext once we have the tcId.
 
 		case Reconnect:
 			// Resume the res sequence from where the client left off.
@@ -208,6 +145,11 @@ func handleMessage(conn net.Conn) {
 			if ackVal, ok := mapData["ack"]; ok && ackVal != nil {
 				nextRes = int(ackVal.(float64)) + 1
 			}
+			player, playerErr := store.GetPlayer()
+			if playerErr != nil {
+				log.Println("reconnect: failed to load player:", playerErr)
+				break
+			}
 			files := map[string]string{}
 			if fd, ok := msgData.(map[string]interface{}); ok {
 				if f2s, ok := fd["fileToSha1"].(map[string]interface{}); ok {
@@ -219,12 +161,12 @@ func handleMessage(conn net.Conn) {
 			sendErr = sendMessage(zlibWriter, &nextRes, Connect, req, map[string]interface{}{
 				"urls":         []string{},
 				"pushCmdPairs": []interface{}{},
-				"cid":          "8d0ed094-4f5c-417e-bd29-489ce818e570",
-				"kid":          "8d0ed094-4f5c-417e-bd29-489ce818e570",
+				"cid":          player.UUID,
+				"kid":          player.UUID,
 				"loginResponse": map[string]interface{}{
-					"uuid":             "8d0ed094-4f5c-417e-bd29-489ce818e570",
-					"requestedCid":     "8d0ed094-4f5c-417e-bd29-489ce818e570",
-					"bestAlias":        "Tenshii",
+					"uuid":             player.UUID,
+					"requestedCid":     player.UUID,
+					"bestAlias":        player.Alias,
 					"currencyBalances": map[string]interface{}{},
 				},
 				"filesToOTA":          []interface{}{},
@@ -235,11 +177,17 @@ func handleMessage(conn net.Conn) {
 					"serverTimeMillis": time.Now().UnixMilli(),
 				},
 			})
+			// On reconnect, send sessionConfiguration immediately if we know the player's tcId
+			// (e.g. server restarted between sessions). This sets sendClientBlobsWithTransaction
+			// before any replayed transactions run.
 			if sendErr == nil {
-				sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
-					"type":                           "sessionConfiguration",
-					"sendClientBlobsWithTransaction": true,
-				})
+				if tcID := store.GetPlayerTcID(player.UUID); tcID != 0 {
+					sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
+						"type":                           "sessionConfiguration",
+						"tcId":                           tcID,
+						"sendClientBlobsWithTransaction": true,
+					})
+				}
 			}
 
 		case Heartbeat:
@@ -247,13 +195,29 @@ func handleMessage(conn net.Conn) {
 
 		case OnNewTransactionContext:
 			eventData := msgData.(map[string]interface{})
-			transactionId := int(eventData["tcId"].(float64))
+			tcID := int(eventData["tcId"].(float64))
 			timelineId := int(eventData["timelineId"].(float64))
-			transactions[transactionId] = &TransactionContext{
-				TransactionID: transactionId,
+			transactions[tcID] = &TransactionContext{
+				TransactionID: tcID,
 				TimelineID:    timelineId,
 			}
+			// Persist the tcId so reconnects can include it in sessionConfiguration.
+			player, playerErr := store.GetPlayer()
+			if playerErr == nil {
+				if err := store.SetPlayerTcID(player.UUID, tcID); err != nil {
+					log.Printf("onNewTransactionContext: failed to save tcId: %v", err)
+				}
+			}
 			sendErr = sendMessage(zlibWriter, &nextRes, Luas, req, map[string]interface{}{})
+			// Send sessionConfiguration with the correct tcId so the client sets
+			// sendClientBlobsWithTransaction=true before running startPlaySession.
+			if sendErr == nil {
+				sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
+					"type":                           "sessionConfiguration",
+					"tcId":                           tcID,
+					"sendClientBlobsWithTransaction": true,
+				})
+			}
 
 		case RequestDocuments:
 			message := msgData.(map[string]interface{})["message"].(map[string]interface{})
@@ -281,15 +245,33 @@ func handleMessage(conn net.Conn) {
 
 			blobStoreKeys := message["blobStoreKeys"].([]interface{})
 
-			// Return empty updates — we don't have real document data and sending
-			// malformed documentFragmentIds (missing the middle fragmentId segment)
-			// causes client-side parse errors. The client tracks blobStoreKeys as
-			// "requested" regardless of whether updates are present.
+			updates := make([]map[string]interface{}, 0)
+			for _, k := range blobStoreKeys {
+				key, ok := k.(string)
+				if !ok {
+					continue
+				}
+				// Each requestDocuments key is a 2-part prefix "{docType}:{documentId}".
+				// Look up all stored fragments matching "{docType}:*:{documentId}".
+				frags, err := store.GetFragmentsForDocument(key)
+				if err != nil {
+					log.Printf("requestDocuments: error querying fragments for %s: %v", key, err)
+					continue
+				}
+				for fragKey, blob := range frags {
+					updates = append(updates, map[string]interface{}{
+						"documentFragmentId": fragKey,
+						"blobJson":           blob,
+					})
+				}
+			}
+			log.Printf("requestDocuments: returning %d fragments for %d keys", len(updates), len(blobStoreKeys))
+
 			sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
 				"type":          "requestDocumentsResponse",
 				"tcId":          transactionId,
 				"blobStoreKeys": blobStoreKeys,
-				"updates":       []interface{}{},
+				"updates":       updates,
 			})
 			if sendErr == nil {
 				sendErr = sendMessage(zlibWriter, &nextRes, Luas, req, map[string]interface{}{})
@@ -315,9 +297,9 @@ func handleMessage(conn net.Conn) {
 			updates := make([]map[string]interface{}, 0, len(fragmentIds))
 			for _, id := range fragmentIds {
 				key := id.(string)
-				blobJson := fakeFragmentBlob(key)
+				blobJson := store.FragmentBlob(key)
 				if blobJson == "" {
-					log.Printf("requestDocumentFragments: no fake blob for %s, skipping", key)
+					log.Printf("requestDocumentFragments: no blob for %s, skipping", key)
 					continue
 				}
 				updates = append(updates, map[string]interface{}{
@@ -341,8 +323,13 @@ func handleMessage(conn net.Conn) {
 			// Lua reads response.players: map of game-uuid → {friendType: platformId}.
 			// We don't need real Facebook IDs — the game falls back to FriendsInfo blobs
 			// for display name/level, so empty platform ID maps work fine.
-			players := make(map[string]interface{}, len(fakeFriends))
-			for _, f := range fakeFriends {
+			friends, friendsErr := store.GetFriends()
+			if friendsErr != nil {
+				log.Println("getFriendPlayers: failed to load friends:", friendsErr)
+				friends = nil
+			}
+			players := make(map[string]interface{}, len(friends))
+			for _, f := range friends {
 				players[f.UUID] = map[string]interface{}{}
 			}
 			sendErr = sendMessage(zlibWriter, &nextRes, GetFriendPlayers, req, map[string]interface{}{
@@ -354,6 +341,8 @@ func handleMessage(conn net.Conn) {
 			// The client sends a transaction for the server to validate and persist.
 			// We accept every transaction optimistically: reflect back the same
 			// transactionId/timelineId/tcId so the Lua transaction context marks it acked.
+			// When sendClientBlobsWithTransaction=true, each verifyHashes entry includes a
+			// .blob field with the actual JSON — we persist those to document_fragments.
 			var transactionId, timelineId interface{}
 			var tcId float64
 			if md, ok := msgData.(map[string]interface{}); ok {
@@ -362,6 +351,75 @@ func handleMessage(conn net.Conn) {
 					timelineId = msg["timelineId"]
 					if v, ok := msg["tcId"].(float64); ok {
 						tcId = v
+					}
+
+					// Parse invoke for the audit log.
+					playerUUID, facade, methodName, args := "", "", "", ""
+					if inv, ok := msg["invoke"].(map[string]interface{}); ok {
+						methodName, _ = inv["methodName"].(string)
+						if fc, ok := inv["facade"].(map[string]interface{}); ok {
+							facade, _ = fc["c"].(string)
+							if a, ok := fc["a"].([]interface{}); ok && len(a) > 0 {
+								if ref, ok := a[0].(map[string]interface{}); ok {
+									playerUUID, _ = ref["uuid"].(string)
+								}
+							}
+						}
+						if a, ok := inv["args"].([]interface{}); ok {
+							if b, err := json.Marshal(a); err == nil {
+								args = string(b)
+							}
+						}
+					}
+					tlID, tlOK := timelineId.(float64)
+					txID, txOK := transactionId.(float64)
+					if !tlOK || !txOK {
+						log.Printf("executeTransaction: unexpected type for timelineId=%T transactionId=%T", timelineId, transactionId)
+					} else {
+						if err := store.RecordTransaction(
+							playerUUID, int(tcId), int(tlID), int(txID),
+							facade, methodName, args,
+						); err != nil {
+							log.Printf("executeTransaction: failed to record transaction: %v", err)
+						} else {
+							log.Printf("executeTransaction: recorded txn %d player=%s facade=%s method=%s", int(txID), playerUUID, facade, methodName)
+						}
+					}
+
+					// Persist blobs from verifyHashes (present when sendClientBlobsWithTransaction=true).
+					if vh, ok := msg["verifyHashes"].(map[string]interface{}); ok {
+						for _, listKey := range []string{"insert", "update"} {
+							if list, ok := vh[listKey].([]interface{}); ok {
+								for _, entry := range list {
+									e, ok := entry.(map[string]interface{})
+									if !ok {
+										continue
+									}
+									key, _ := e["key"].(string)
+									hash, _ := e["value"].(string)
+									blob, hasBlob := e["blob"].(string)
+									if key == "" || hash == "" || !hasBlob {
+										continue
+									}
+									if err := store.UpsertFragment(key, blob, hash); err != nil {
+										log.Printf("executeTransaction: failed to upsert fragment %s: %v", key, err)
+									} else {
+										log.Printf("executeTransaction: stored fragment %s", key)
+									}
+								}
+							}
+						}
+						if delList, ok := vh["delete"].([]interface{}); ok {
+							for _, entry := range delList {
+								if e, ok := entry.(map[string]interface{}); ok {
+									if key, _ := e["key"].(string); key != "" {
+										if err := store.DeleteFragment(key); err != nil {
+											log.Printf("executeTransaction: failed to delete fragment %s: %v", key, err)
+										}
+									}
+								}
+							}
+						}
 					}
 				}
 			}
