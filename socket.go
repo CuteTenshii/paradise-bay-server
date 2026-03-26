@@ -14,63 +14,82 @@ import (
 
 // Offline fake blobs for VIRTUAL fragment types (mirrors the game's own initialFakes).
 // Key = document type prefix of the fragment blob store key.
-var virtualFragmentFakes = map[string]string{
+var virtualFragmentFakes = VirtualFragment{
 	"VIRTUAL_PlayerCurrency":  `{"currencyBalances":{"Nanopods2":120000,"Gems":150000},"lifetimeValueDollars":100,"_t":"VirtualPlayerCurrency:v1"}`,
 	"VIRTUAL_PlayerInfo":      `{"bestAlias":"Lieutenant Herta","_t":"VirtualPlayerInfo:v1"}`,
 	"VIRTUAL_PlayerFriends":   `{"friendPlayerViews":{},"_t":"VirtualPlayerFriends:v1"}`,
 	"VIRTUAL_LeaderboardTier": `{"tier":"Tier0","_t":"LeaderboardTierVirtualFragment:v1"}`,
 }
 
+// fakeFriends is the list of players that will appear in the in-game friends list.
+// Add entries here to populate the social panel without needing a real Facebook login.
+// UUID can be any valid UUID-shaped string; Alias is the display name shown in-game.
+var fakeFriends = []Friend{
+	{"11111111-1111-1111-1111-111111111111", "Test Friend", 10},
+}
+
+// friendsInfoBlob returns a serialised FriendsInfoFragment for the given alias/level.
+// The structure mirrors FriendsInfoFragment.init() → {info: getDefaultFriendsInfoView()}.
+func friendsInfoBlob(alias string, level int) string {
+	blob, _ := json.Marshal(map[string]interface{}{
+		"_t": "FriendsInfoFragment:v1",
+		"info": map[string]interface{}{
+			"level":                    level,
+			"diveExpiryTimeMillis":     0,
+			"diveSiteExpiryTimeMillis": 0,
+			"tradefestProgress":        map[string]interface{}{},
+			"iconUri":                  "",
+			"bestAlias":                alias,
+			"socialFeedablePetInfo":    map[string]interface{}{},
+		},
+	})
+	return string(blob)
+}
+
+// fakeFriendMap is built once at startup for O(1) lookup keyed by UUID.
+var fakeFriendMap = func() map[string]struct {
+	Alias string
+	Level int
+} {
+	m := make(map[string]struct {
+		Alias string
+		Level int
+	}, len(fakeFriends))
+	for _, f := range fakeFriends {
+		m[f.UUID] = struct {
+			Alias string
+			Level int
+		}{f.Alias, f.Level}
+	}
+	return m
+}()
+
 func fakeFragmentBlob(fragmentBlobStoreKey string) string {
-	if colonIdx := strings.Index(fragmentBlobStoreKey, ":"); colonIdx != -1 {
-		if fake, ok := virtualFragmentFakes[fragmentBlobStoreKey[:colonIdx]]; ok {
-			return fake
+	// Key format: "{documentType}:{fragmentId}:{documentId}"
+	// e.g. "FriendsInfo:friendsInfo:P[11111111-...]"
+	first := strings.Index(fragmentBlobStoreKey, ":")
+	if first == -1 {
+		return ""
+	}
+	docType := fragmentBlobStoreKey[:first]
+
+	if docType == "FriendsInfo" {
+		// Extract UUID from "P[uuid]" at the end of the key.
+		pStart := strings.Index(fragmentBlobStoreKey, "P[")
+		pEnd := strings.LastIndex(fragmentBlobStoreKey, "]")
+		if pStart != -1 && pEnd > pStart {
+			uuid := fragmentBlobStoreKey[pStart+2 : pEnd]
+			if f, ok := fakeFriendMap[uuid]; ok {
+				return friendsInfoBlob(f.Alias, f.Level)
+			}
 		}
+		return ""
+	}
+
+	if fake, ok := virtualFragmentFakes[docType]; ok {
+		return fake
 	}
 	return ""
-}
-
-type Command string
-
-const (
-	Connect                  Command = "connect"
-	Reconnect                Command = "reconnect"
-	Heartbeat                Command = "heartbeat"
-	OnNewTransactionContext  Command = "onNewTransactionContext"
-	TransactionAccepted      Command = "transactionAccepted"
-	RequestDocuments         Command = "requestDocuments"
-	RequestDocumentFragments Command = "requestDocumentFragments"
-	RequestDocumentsResponse Command = "requestDocumentsResponse"
-	GetFriendPlayers         Command = "getFriendPlayers2"
-	ValidateOnDemandFiles    Command = "validateOnDemandFiles"
-	LuaSessionMessage        Command = "luaSessionMessage"
-	Luas                     Command = "luas"
-	GetInAppProducts         Command = "getInAppProducts2"
-	ExecuteTransaction       Command = "executeTransaction"
-)
-
-type ClientMessage struct {
-	// The command to execute
-	Cmd Command `json:"cmd"`
-	// Data of the message. Can be nil
-	Data any `json:"data"`
-	// Request ID
-	Request float64 `json:"req"`
-	// Response ID
-	Response float64 `json:"res"`
-	// Session cookie
-	Session string `json:"ses"`
-}
-
-type LuaMessage struct {
-	Cmd      Command `json:"cmd"`
-	Response float64 `json:"res"`
-	Data     any     `json:"data"`
-}
-
-type TransactionContext struct {
-	TransactionID int
-	TimelineID    int
 }
 
 func StartSocket(port int) {
@@ -256,8 +275,8 @@ func handleMessage(conn net.Conn) {
 
 			transactionId := int(tcIdVal.(float64))
 			if transactions[transactionId] == nil {
-				log.Println("No transaction found:", transactionId)
-				continue
+				log.Printf("requestDocuments: auto-registering unknown tcId %d", transactionId)
+				transactions[transactionId] = &TransactionContext{TransactionID: transactionId}
 			}
 
 			blobStoreKeys := message["blobStoreKeys"].([]interface{})
@@ -288,8 +307,8 @@ func handleMessage(conn net.Conn) {
 
 			transactionId := int(tcIdVal.(float64))
 			if transactions[transactionId] == nil {
-				log.Println("No transaction found:", transactionId)
-				continue
+				log.Printf("requestDocumentFragments: auto-registering unknown tcId %d", transactionId)
+				transactions[transactionId] = &TransactionContext{TransactionID: transactionId}
 			}
 
 			fragmentIds := message["documentFragmentIds"].([]interface{})
@@ -319,9 +338,15 @@ func handleMessage(conn net.Conn) {
 			}
 
 		case GetFriendPlayers:
-			// Lua reads response.players (map of uuid→{service→id}), not response.friends.
+			// Lua reads response.players: map of game-uuid → {friendType: platformId}.
+			// We don't need real Facebook IDs — the game falls back to FriendsInfo blobs
+			// for display name/level, so empty platform ID maps work fine.
+			players := make(map[string]interface{}, len(fakeFriends))
+			for _, f := range fakeFriends {
+				players[f.UUID] = map[string]interface{}{}
+			}
 			sendErr = sendMessage(zlibWriter, &nextRes, GetFriendPlayers, req, map[string]interface{}{
-				"players": map[string]interface{}{},
+				"players": players,
 				"more":    false,
 			})
 
