@@ -34,6 +34,12 @@ Write-Host ""
 # ---------------------------------------------------------------------------
 Write-Host "[2/2] Installing Appx ..." -ForegroundColor Yellow
 
+$sig = Join-Path $PSScriptRoot "AppxSignature.p7x"
+if (Test-Path -LiteralPath $sig) {
+    Remove-Item -LiteralPath $sig -Force
+    Write-Host "  Deleted AppxSignature.p7x" -ForegroundColor Gray
+}
+
 $existing = Get-AppxPackage -Name "king.com.ParadiseBay" -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "  Removing old version ($($existing.Version)) ..."

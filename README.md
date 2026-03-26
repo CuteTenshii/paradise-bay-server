@@ -18,32 +18,11 @@ The game running on Windows 11 25H2 and being debugged on Visual Studio 2022.
 ### Modifying files
 
 1. Extract the appx using 7-Zip (WinRAR probably works)
-2. Delete `AppxSignature.p7x` (required otherwise Windows won't install the package) 
-3. Open `game-info.json`, search for `"Server List":`
-4. Before `"http://tk1-win.z2live.com/"`, add `"http://localhost:8080"` (with the quotes)
+2. Open `game-info.json`, search for `"Server List":`, and replace `"http://tk1-win.z2live.com/"` with `"http://localhost:3300"` (keep the quotes)
 
 ### Installing the game
 
 1. Enable "Developer Mode":
    - **Windows 10:** idk 
    - **Windows 11:** System > For developers > Check "Developer Mode"
-2. Open PowerShell, cd to the extracted appx and run this:
-   ```shell
-   Add-AppxPackage -Register ".\AppxManifest.xml"
-   ```
-   which registers the Appx package. If everything went well, you should see the game in your start menu
-
-## Progress
-
-When sending the `connect` payload back to the server, you need to send some info. I'm searching for this stuff across the code in BN.
-
-To this day I'm stuck with this issue:
-```shell
-Z2PCodeError: ZPSocketChannel::onConnectResponse. Session empty! {
-}
-onecore\base\AppModel\Runtime\Src\PackagePath.hpp(144)\kernelbase.dll!7669646E: (caller: 76695FF9) ReturnHr(20) tid(1304) 80073D5B The package does not have a mutable directory.
-SID    FBD5, 367.255s: Z2PCodeError: ZPSocketChannel::onConnectResponse. Session empty! {
-}
-```
-
-I think some fields are missing in the payload but I'm struggling finding them.
+2. Run `install.bat`
