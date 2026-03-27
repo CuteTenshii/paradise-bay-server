@@ -1,0 +1,8 @@
+.idea
+*.db*
+
+*.md
+screenshot.png
+
+*.bat
+*.ps1
