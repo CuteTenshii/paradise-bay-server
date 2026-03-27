@@ -29,6 +29,7 @@ type Player struct {
 	LifetimeValueDollars float64 `bun:"lifetime_value_dollars,notnull,default:100"`
 	LeaderboardTier      string  `bun:"leaderboard_tier,notnull,default:'Tier0'"`
 	CurrentTcID          *int    `bun:"current_tc_id"`
+	Z2DID                string  `bun:"z2did"`
 }
 
 // VirtualFragment is a pre-computed game data blob keyed by doc_type.
@@ -95,6 +96,7 @@ func OpenDB(path string) (*Store, error) {
 	migrations := []string{
 		`ALTER TABLE transactions ADD COLUMN player_uuid TEXT`,
 		`ALTER TABLE players ADD COLUMN current_tc_id INTEGER`,
+		`ALTER TABLE players ADD COLUMN z2did TEXT`,
 	}
 	for _, m := range migrations {
 		if _, err = db.ExecContext(ctx, m); err != nil {
@@ -222,6 +224,37 @@ func (s *Store) seedFriendVillage(ctx context.Context, uuid string) error {
 func (s *Store) GetPlayer() (Player, error) {
 	var p Player
 	err := s.db.NewSelect().Model(&p).Limit(1).Scan(context.Background())
+	return p, err
+}
+
+// GetPlayerByCID returns the player with the given UUID.
+// Returns sql.ErrNoRows if no player with that UUID exists.
+func (s *Store) GetPlayerByCID(uuid string) (Player, error) {
+	var p Player
+	err := s.db.NewSelect().Model(&p).Where("uuid = ?", uuid).Scan(context.Background())
+	return p, err
+}
+
+// GetPlayerByZ2DID returns the player associated with the given device ID.
+// Returns sql.ErrNoRows if no player with that z2did exists.
+func (s *Store) GetPlayerByZ2DID(z2did string) (Player, error) {
+	var p Player
+	err := s.db.NewSelect().Model(&p).Where("z2did = ?", z2did).Scan(context.Background())
+	return p, err
+}
+
+// CreatePlayer inserts a new player row with default currency values and returns it.
+func (s *Store) CreatePlayer(uuid, alias, z2did string) (Player, error) {
+	p := Player{
+		UUID:                 uuid,
+		Alias:                alias,
+		Nanopods:             120000,
+		Gems:                 150000,
+		LifetimeValueDollars: 100.0,
+		LeaderboardTier:      "Tier0",
+		Z2DID:                z2did,
+	}
+	_, err := s.db.NewInsert().Model(&p).Exec(context.Background())
 	return p, err
 }
 

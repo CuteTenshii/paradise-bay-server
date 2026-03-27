@@ -2,13 +2,17 @@ package main
 
 import (
 	"compress/zlib"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // friendsInfoBlob returns a serialised FriendsInfoFragment for the given alias/level.
@@ -50,9 +54,10 @@ func StartSocket(port int, store *Store) {
 func handleMessage(conn net.Conn, store *Store) {
 	defer conn.Close()
 
-	// Per-connection state: strictly incrementing res counter and transaction map
+	// Per-connection state: res counter, transaction map, and the authenticated player UUID.
 	nextRes := 0
 	transactions := make(map[int]*TransactionContext)
+	var playerUUID string
 
 	// One continuous zlib stream for reading (client sends all messages in one stream)
 	zlibReader, err := zlib.NewReader(conn)
@@ -95,8 +100,6 @@ func handleMessage(conn net.Conn, store *Store) {
 		}
 		msgData := mapData["data"]
 
-		log.Printf("Received message: cmd=%s, req=%.0f, data=%v", cmd, req, msgData)
-
 		if cmd == Connect {
 			nextRes = 0
 		}
@@ -104,38 +107,14 @@ func handleMessage(conn net.Conn, store *Store) {
 		var sendErr error
 		switch cmd {
 		case Connect:
-			player, playerErr := store.GetPlayer()
+			player, playerErr := resolvePlayer(store, msgData)
 			if playerErr != nil {
-				log.Println("connect: failed to load player:", playerErr)
+				log.Println("connect: failed to resolve player:", playerErr)
 				break
 			}
-			files := map[string]string{}
-			if fd, ok := msgData.(map[string]interface{}); ok {
-				if f2s, ok := fd["fileToSha1"].(map[string]interface{}); ok {
-					for name, v := range f2s {
-						files[name] = v.(string)
-					}
-				}
-			}
-			sendErr = sendMessage(zlibWriter, &nextRes, Connect, req, map[string]interface{}{
-				"urls":         []string{},
-				"pushCmdPairs": []interface{}{},
-				"cid":          player.UUID,
-				"kid":          player.UUID,
-				"loginResponse": map[string]interface{}{
-					"uuid":             player.UUID,
-					"requestedCid":     player.UUID,
-					"bestAlias":        player.Alias,
-					"currencyBalances": map[string]interface{}{},
-				},
-				"filesToOTA":          []interface{}{},
-				"fileToSha1":          files,
-				"zenSettings":         map[string]interface{}{},
-				"connectResponseData": []any{},
-				"sessionConfig": map[string]interface{}{
-					"serverTimeMillis": time.Now().UnixMilli(),
-				},
-			})
+			playerUUID = player.UUID
+			files := extractFileToSha1(msgData)
+			sendErr = sendMessage(zlibWriter, &nextRes, Connect, req, connectPayload(player, files))
 			// sessionConfiguration is sent in OnNewTransactionContext once we have the tcId.
 
 		case Reconnect:
@@ -145,38 +124,14 @@ func handleMessage(conn net.Conn, store *Store) {
 			if ackVal, ok := mapData["ack"]; ok && ackVal != nil {
 				nextRes = int(ackVal.(float64)) + 1
 			}
-			player, playerErr := store.GetPlayer()
+			player, playerErr := resolvePlayer(store, msgData)
 			if playerErr != nil {
-				log.Println("reconnect: failed to load player:", playerErr)
+				log.Println("reconnect: failed to resolve player:", playerErr)
 				break
 			}
-			files := map[string]string{}
-			if fd, ok := msgData.(map[string]interface{}); ok {
-				if f2s, ok := fd["fileToSha1"].(map[string]interface{}); ok {
-					for name, v := range f2s {
-						files[name] = v.(string)
-					}
-				}
-			}
-			sendErr = sendMessage(zlibWriter, &nextRes, Connect, req, map[string]interface{}{
-				"urls":         []string{},
-				"pushCmdPairs": []interface{}{},
-				"cid":          player.UUID,
-				"kid":          player.UUID,
-				"loginResponse": map[string]interface{}{
-					"uuid":             player.UUID,
-					"requestedCid":     player.UUID,
-					"bestAlias":        player.Alias,
-					"currencyBalances": map[string]interface{}{},
-				},
-				"filesToOTA":          []interface{}{},
-				"fileToSha1":          files,
-				"zenSettings":         map[string]interface{}{},
-				"connectResponseData": []any{},
-				"sessionConfig": map[string]interface{}{
-					"serverTimeMillis": time.Now().UnixMilli(),
-				},
-			})
+			playerUUID = player.UUID
+			files := extractFileToSha1(msgData)
+			sendErr = sendMessage(zlibWriter, &nextRes, Connect, req, connectPayload(player, files))
 			// On reconnect, send sessionConfiguration immediately if we know the player's tcId
 			// (e.g. server restarted between sessions). This sets sendClientBlobsWithTransaction
 			// before any replayed transactions run.
@@ -202,9 +157,8 @@ func handleMessage(conn net.Conn, store *Store) {
 				TimelineID:    timelineId,
 			}
 			// Persist the tcId so reconnects can include it in sessionConfiguration.
-			player, playerErr := store.GetPlayer()
-			if playerErr == nil {
-				if err := store.SetPlayerTcID(player.UUID, tcID); err != nil {
+			if playerUUID != "" {
+				if err := store.SetPlayerTcID(playerUUID, tcID); err != nil {
 					log.Printf("onNewTransactionContext: failed to save tcId: %v", err)
 				}
 			}
@@ -468,6 +422,85 @@ func handleMessage(conn net.Conn, store *Store) {
 	}
 }
 
+// resolvePlayer looks up the player from a connect/reconnect message data payload.
+//
+// If the message contains a cid, that UUID is used for the lookup.
+// If there is no cid (first launch), the device's z2did is used instead.
+// A new player row is created automatically when neither matches an existing record.
+func resolvePlayer(store *Store, msgData any) (Player, error) {
+	cid, z2did := "", ""
+	if fd, ok := msgData.(map[string]interface{}); ok {
+		cid, _ = fd["cid"].(string)
+		if udid, ok := fd["udidInfo"].(map[string]interface{}); ok {
+			z2did, _ = udid["z2did"].(string)
+		}
+	}
+
+	// Returning player: look up by cid.
+	if cid != "" {
+		p, err := store.GetPlayerByCID(cid)
+		if err == nil {
+			return p, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return Player{}, err
+		}
+		// cid not in DB — fall through to z2did / create.
+	}
+
+	// First launch or recovered device: look up by z2did.
+	if z2did != "" {
+		p, err := store.GetPlayerByZ2DID(z2did)
+		if err == nil {
+			return p, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return Player{}, err
+		}
+	}
+
+	// Brand-new player: generate a UUID and create the row.
+	newUUID := uuid.New().String()
+	log.Printf("connect: new player %s (z2did=%s) — creating account", newUUID, z2did)
+	return store.CreatePlayer(newUUID, "Guest", z2did)
+}
+
+// extractFileToSha1 pulls the fileToSha1 map out of a connect/reconnect data payload.
+func extractFileToSha1(msgData any) map[string]string {
+	files := map[string]string{}
+	if fd, ok := msgData.(map[string]interface{}); ok {
+		if f2s, ok := fd["fileToSha1"].(map[string]interface{}); ok {
+			for name, v := range f2s {
+				files[name] = v.(string)
+			}
+		}
+	}
+	return files
+}
+
+// connectPayload builds the data map for a connect/reconnect response.
+func connectPayload(player Player, files map[string]string) map[string]interface{} {
+	return map[string]interface{}{
+		"urls":         []string{},
+		"pushCmdPairs": []interface{}{},
+		"cid":          player.UUID,
+		"kid":          player.UUID,
+		"loginResponse": map[string]interface{}{
+			"uuid":             player.UUID,
+			"requestedCid":     player.UUID,
+			"bestAlias":        player.Alias,
+			"currencyBalances": map[string]interface{}{},
+		},
+		"filesToOTA":          []interface{}{},
+		"fileToSha1":          files,
+		"zenSettings":         map[string]interface{}{},
+		"connectResponseData": []any{},
+		"sessionConfig": map[string]interface{}{
+			"serverTimeMillis": time.Now().UnixMilli(),
+		},
+	}
+}
+
 func sendMessage(w *zlib.Writer, nextRes *int, cmd Command, req float64, data any) error {
 	message := ClientMessage{
 		Cmd:      cmd,
@@ -481,7 +514,7 @@ func sendMessage(w *zlib.Writer, nextRes *int, cmd Command, req float64, data an
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-	log.Println("[SENT]", string(jsonBytes))
+
 	return writeFrame(w, jsonBytes)
 }
 
@@ -496,7 +529,7 @@ func sendLuaMessage(w *zlib.Writer, nextRes *int, data any) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-	log.Println("[SENT]", string(jsonBytes))
+
 	return writeFrame(w, jsonBytes)
 }
 
