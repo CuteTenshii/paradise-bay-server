@@ -1,70 +1,94 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/sqlitedialect"
 	_ "modernc.org/sqlite"
 )
 
-// Store wraps the SQLite database and provides game-data access methods.
+// Store wraps the Bun database and provides game-data access methods.
 type Store struct {
-	db *sql.DB
+	db *bun.DB
+}
+
+// Player holds the data for the single player account.
+type Player struct {
+	bun.BaseModel        `bun:"table:players"`
+	UUID                 string  `bun:"uuid,pk"`
+	Alias                string  `bun:"alias,notnull"`
+	Nanopods             int64   `bun:"nanopods,notnull,default:120000"`
+	Gems                 int64   `bun:"gems,notnull,default:150000"`
+	LifetimeValueDollars float64 `bun:"lifetime_value_dollars,notnull,default:100"`
+	LeaderboardTier      string  `bun:"leaderboard_tier,notnull,default:'Tier0'"`
+	CurrentTcID          *int    `bun:"current_tc_id"`
+}
+
+// VirtualFragment is a pre-computed game data blob keyed by doc_type.
+type VirtualFragment struct {
+	bun.BaseModel `bun:"table:virtual_fragments"`
+	DocType       string `bun:"doc_type,pk"`
+	BlobJSON      string `bun:"blob_json,notnull"`
+}
+
+// DocumentFragment is a persisted game entity fragment keyed by its full key.
+type DocumentFragment struct {
+	bun.BaseModel `bun:"table:document_fragments"`
+	Key           string `bun:"key,pk"`
+	BlobJSON      string `bun:"blob_json,notnull"`
+	Hash          string `bun:"hash,notnull"`
+	UpdatedAt     string `bun:"updated_at,notnull"`
+}
+
+// TransactionRecord is a row in the transactions audit log.
+type TransactionRecord struct {
+	bun.BaseModel `bun:"table:transactions"`
+	ID            int64  `bun:"id,pk,autoincrement"`
+	PlayerUUID    string `bun:"player_uuid"`
+	TcID          int    `bun:"tc_id,notnull"`
+	TimelineID    int    `bun:"timeline_id,notnull"`
+	TransactionID int    `bun:"transaction_id,notnull"`
+	Facade        string `bun:"facade"`
+	MethodName    string `bun:"method_name"`
+	Args          string `bun:"args"`
+	CreatedAt     string `bun:"created_at,notnull"`
 }
 
 // OpenDB opens (or creates) the SQLite database at path, applies the schema,
 // and seeds default rows if the tables are empty.
 func OpenDB(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	ctx := context.Background()
+
+	sqldb, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err = db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+
+	if _, err = db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
 		return nil, err
 	}
 
-	schema := `
-	CREATE TABLE IF NOT EXISTS players (
-		uuid                   TEXT PRIMARY KEY,
-		alias                  TEXT NOT NULL,
-		nanopods               INTEGER NOT NULL DEFAULT 120000,
-		gems                   INTEGER NOT NULL DEFAULT 150000,
-		lifetime_value_dollars REAL NOT NULL DEFAULT 100,
-		leaderboard_tier       TEXT NOT NULL DEFAULT 'Tier0'
-	);
-	CREATE TABLE IF NOT EXISTS friends (
-		uuid  TEXT PRIMARY KEY,
-		alias TEXT NOT NULL,
-		level INTEGER NOT NULL DEFAULT 1
-	);
-	CREATE TABLE IF NOT EXISTS virtual_fragments (
-		doc_type  TEXT PRIMARY KEY,
-		blob_json TEXT NOT NULL
-	);
-	CREATE TABLE IF NOT EXISTS document_fragments (
-		key        TEXT PRIMARY KEY,
-		blob_json  TEXT NOT NULL,
-		hash       TEXT NOT NULL,
-		updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-	);
-	CREATE TABLE IF NOT EXISTS transactions (
-		id             INTEGER PRIMARY KEY AUTOINCREMENT,
-		player_uuid    TEXT,
-		tc_id          INTEGER NOT NULL,
-		timeline_id    INTEGER NOT NULL,
-		transaction_id INTEGER NOT NULL,
-		facade         TEXT,
-		method_name    TEXT,
-		args           TEXT,
-		created_at     TEXT NOT NULL DEFAULT (datetime('now'))
-	);
-	`
-	if _, err = db.Exec(schema); err != nil {
-		return nil, err
+	// Create tables from models.
+	models := []any{
+		(*Player)(nil),
+		(*Friend)(nil),
+		(*VirtualFragment)(nil),
+		(*DocumentFragment)(nil),
+		(*TransactionRecord)(nil),
+	}
+	for _, model := range models {
+		if _, err = db.NewCreateTable().Model(model).IfNotExists().Exec(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	// Migrations — ADD COLUMN is idempotent when we ignore "duplicate column name".
@@ -73,7 +97,7 @@ func OpenDB(path string) (*Store, error) {
 		`ALTER TABLE players ADD COLUMN current_tc_id INTEGER`,
 	}
 	for _, m := range migrations {
-		if _, err = db.Exec(m); err != nil {
+		if _, err = db.ExecContext(ctx, m); err != nil {
 			if !strings.Contains(err.Error(), "duplicate column name") {
 				return nil, err
 			}
@@ -81,79 +105,67 @@ func OpenDB(path string) (*Store, error) {
 	}
 
 	s := &Store{db: db}
-	if err = s.seed(); err != nil {
+	if err = s.seed(ctx); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) seed() error {
-	var count int
-
+func (s *Store) seed(ctx context.Context) error {
 	// Seed players
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM players`).Scan(&count); err != nil {
+	count, err := s.db.NewSelect().Model((*Player)(nil)).Count(ctx)
+	if err != nil {
 		return err
 	}
 	if count == 0 {
-		_, err := s.db.Exec(
-			`INSERT INTO players (uuid, alias, nanopods, gems, lifetime_value_dollars, leaderboard_tier) VALUES (?, ?, ?, ?, ?, ?)`,
-			"8d0ed094-4f5c-417e-bd29-489ce818e570", "Tenshii", 120000, 150000, 100.0, "Tier0",
-		)
-		if err != nil {
+		p := &Player{
+			UUID:                 "8d0ed094-4f5c-417e-bd29-489ce818e570",
+			Alias:                "Tenshii",
+			Nanopods:             120000,
+			Gems:                 150000,
+			LifetimeValueDollars: 100.0,
+			LeaderboardTier:      "Tier0",
+		}
+		if _, err = s.db.NewInsert().Model(p).Exec(ctx); err != nil {
 			return err
 		}
 	}
 
 	// Seed friends
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM friends`).Scan(&count); err != nil {
+	count, err = s.db.NewSelect().Model((*Friend)(nil)).Count(ctx)
+	if err != nil {
 		return err
 	}
 	if count == 0 {
-		_, err := s.db.Exec(
-			`INSERT INTO friends (uuid, alias, level) VALUES (?, ?, ?)`,
-			"11111111-1111-1111-1111-111111111111", "Test Friend", 10,
-		)
-		if err != nil {
+		f := &Friend{UUID: "11111111-1111-1111-1111-111111111111", Alias: "Test Friend", Level: 10}
+		if _, err = s.db.NewInsert().Model(f).Exec(ctx); err != nil {
 			return err
 		}
 	}
 
 	// Seed virtual_fragments (only the catch-all VIRTUAL_PlayerFriends blob;
 	// currency/info/tier are generated dynamically from the players row)
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM virtual_fragments`).Scan(&count); err != nil {
+	count, err = s.db.NewSelect().Model((*VirtualFragment)(nil)).Count(ctx)
+	if err != nil {
 		return err
 	}
 	if count == 0 {
-		_, err := s.db.Exec(
-			`INSERT INTO virtual_fragments (doc_type, blob_json) VALUES (?, ?)`,
-			"VIRTUAL_PlayerFriends",
-			`{"friendPlayerViews":{},"_t":"VirtualPlayerFriends:v1"}`,
-		)
-		if err != nil {
+		vf := &VirtualFragment{
+			DocType:  "VIRTUAL_PlayerFriends",
+			BlobJSON: `{"friendPlayerViews":{},"_t":"VirtualPlayerFriends:v1"}`,
+		}
+		if _, err = s.db.NewInsert().Model(vf).Exec(ctx); err != nil {
 			return err
 		}
 	}
 
 	// Seed minimal village fragments for each friend (INSERT OR IGNORE — never overwrite gameplay data).
-	friendRows, err := s.db.Query(`SELECT uuid FROM friends`)
-	if err != nil {
+	var friends []Friend
+	if err = s.db.NewSelect().Model(&friends).Column("uuid").Scan(ctx); err != nil {
 		return err
 	}
-	var friendUUIDs []string
-	for friendRows.Next() {
-		var uuid string
-		if err := friendRows.Scan(&uuid); err != nil {
-			friendRows.Close()
-			return err
-		}
-		friendUUIDs = append(friendUUIDs, uuid)
-	}
-	friendRows.Close()
-	if err := friendRows.Err(); err != nil {
-		return err
-	}
-	for _, uuid := range friendUUIDs {
-		if err := s.seedFriendVillage(uuid); err != nil {
+	for _, f := range friends {
+		if err = s.seedFriendVillage(ctx, f.UUID); err != nil {
 			return err
 		}
 	}
@@ -162,22 +174,16 @@ func (s *Store) seed() error {
 }
 
 // seedFriendVillage inserts the minimal document fragments required to visit a
-// friend's island without a crash.  Uses INSERT OR IGNORE so existing data is
+// friend's island without a crash. Uses ON CONFLICT DO NOTHING so existing data is
 // never overwritten.
-func (s *Store) seedFriendVillage(uuid string) error {
+func (s *Store) seedFriendVillage(ctx context.Context, uuid string) error {
 	fragListBlob := `{"_t":"GameEntityListFragment:v1","entities":{"villageGrid":true}}`
 	gridBlob := `{"_compositionName":"villageGrid_v16.map!villageGrid","_t":"GameEntityFragment:v1","villageGrid":{}}`
 	cacheBlob := `{"_t":"DurableCacheFragment:v1","caches":{"villageFrequentComponentTypeToEntityIds":{"MillDurableComponent":[],"OrderBuildingDurableComponent":[],"StorageDurableComponent":[]},"villageGridEntityLookupCache":{"village":"villageGrid"}}}`
-	// These GamePlayer fragments must exist for the friend so that when the
-	// client visits their island it can load them instead of trying to create
-	// them cross-player (which is not allowed without a special flag).
 	diveSiteManagementBlob := `{"_t":"TKDiveSiteManagementFragment:v1","lastDespawnTimeMillis":0,"rewardSeed":1000000,"inactiveSiteFragmentIds":[],"completedPromoDives":{},"seals":[],"socialRewardSeed":1000000}`
 	storageBlob := `{"_t":"StorageFragment:v1","storage":[]}`
 	badgesBlob := `{"_t":"BadgeFragment:v1","badgeStates":{}}`
 	regionsBlob := `{"_t":"RegionFragment:v1","unlockedRegions":[]}`
-	// EntityCollection:D[GamePlayer] — the GamePlayer entity holds the wallet
-	// component. Without it, GamePlayerFacade.getWalletComponent fails trying
-	// to createIfNeeded outside a transaction.
 	gpEntityListBlob := `{"_t":"GameEntityListFragment:v1","entities":{"gamePlayer":true}}`
 	gpEntityBlob := `{"_compositionName":"player","_t":"GameEntityFragment:v1","facebookIncentive":{"hasReceivedIncentiveRewards":false},"level":[],"preferences":[],"wallet":{"capacity":[],"receivedInitialResources":true,"wealth":{}}}`
 
@@ -196,101 +202,97 @@ func (s *Store) seedFriendVillage(uuid string) error {
 		{"EntityCollection:gamePlayer:D[GamePlayer]P[" + uuid + "]", gpEntityBlob},
 	}
 
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
 	for _, e := range entries {
 		sum := sha256.Sum256([]byte(e.blob))
-		hash := fmt.Sprintf("%x", sum)
-		_, err := s.db.Exec(
-			`INSERT OR IGNORE INTO document_fragments (key, blob_json, hash, updated_at) VALUES (?, ?, ?, datetime('now'))`,
-			e.key, e.blob, hash,
-		)
-		if err != nil {
+		frag := &DocumentFragment{
+			Key:       e.key,
+			BlobJSON:  e.blob,
+			Hash:      fmt.Sprintf("%x", sum),
+			UpdatedAt: now,
+		}
+		if _, err := s.db.NewInsert().Model(frag).On("CONFLICT (key) DO NOTHING").Exec(ctx); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// PlayerRow holds the data for the single player account.
-type PlayerRow struct {
-	UUID                 string
-	Alias                string
-	Nanopods             int64
-	Gems                 int64
-	LifetimeValueDollars float64
-	LeaderboardTier      string
-}
-
 // GetPlayer returns the first (and typically only) player row.
-func (s *Store) GetPlayer() (PlayerRow, error) {
-	var p PlayerRow
-	err := s.db.QueryRow(
-		`SELECT uuid, alias, nanopods, gems, lifetime_value_dollars, leaderboard_tier FROM players LIMIT 1`,
-	).Scan(&p.UUID, &p.Alias, &p.Nanopods, &p.Gems, &p.LifetimeValueDollars, &p.LeaderboardTier)
+func (s *Store) GetPlayer() (Player, error) {
+	var p Player
+	err := s.db.NewSelect().Model(&p).Limit(1).Scan(context.Background())
 	return p, err
 }
 
 // GetFriends returns all rows from the friends table.
 func (s *Store) GetFriends() ([]Friend, error) {
-	rows, err := s.db.Query(`SELECT uuid, alias, level FROM friends`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
 	var friends []Friend
-	for rows.Next() {
-		var f Friend
-		if err := rows.Scan(&f.UUID, &f.Alias, &f.Level); err != nil {
-			return nil, err
-		}
-		friends = append(friends, f)
-	}
-	return friends, rows.Err()
+	err := s.db.NewSelect().Model(&friends).Scan(context.Background())
+	return friends, err
 }
 
 // GetVirtualFragment returns the stored blob_json for the given doc_type.
 // Returns sql.ErrNoRows if not found.
 func (s *Store) GetVirtualFragment(docType string) (string, error) {
-	var blob string
-	err := s.db.QueryRow(`SELECT blob_json FROM virtual_fragments WHERE doc_type = ?`, docType).Scan(&blob)
-	return blob, err
+	var vf VirtualFragment
+	err := s.db.NewSelect().Model(&vf).Where("doc_type = ?", docType).Scan(context.Background())
+	return vf.BlobJSON, err
 }
 
 // SetPlayerTcID persists the client's current transaction context ID for the player.
 func (s *Store) SetPlayerTcID(playerUUID string, tcID int) error {
-	_, err := s.db.Exec(`UPDATE players SET current_tc_id = ? WHERE uuid = ?`, tcID, playerUUID)
+	_, err := s.db.NewUpdate().
+		Model((*Player)(nil)).
+		Set("current_tc_id = ?", tcID).
+		Where("uuid = ?", playerUUID).
+		Exec(context.Background())
 	return err
 }
 
 // GetPlayerTcID returns the last known transaction context ID for the player, or 0 if unset.
 func (s *Store) GetPlayerTcID(playerUUID string) int {
-	var tcID int
-	s.db.QueryRow(`SELECT COALESCE(current_tc_id, 0) FROM players WHERE uuid = ?`, playerUUID).Scan(&tcID)
-	return tcID
+	var p Player
+	s.db.NewSelect().Model(&p).Where("uuid = ?", playerUUID).Scan(context.Background()) //nolint:errcheck
+	if p.CurrentTcID == nil {
+		return 0
+	}
+	return *p.CurrentTcID
 }
 
 // RecordTransaction inserts a row into the transactions audit log.
 func (s *Store) RecordTransaction(playerUUID string, tcID, timelineID, transactionID int, facade, methodName, args string) error {
-	_, err := s.db.Exec(
-		`INSERT INTO transactions (player_uuid, tc_id, timeline_id, transaction_id, facade, method_name, args) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		playerUUID, tcID, timelineID, transactionID, facade, methodName, args,
-	)
+	rec := &TransactionRecord{
+		PlayerUUID:    playerUUID,
+		TcID:          tcID,
+		TimelineID:    timelineID,
+		TransactionID: transactionID,
+		Facade:        facade,
+		MethodName:    methodName,
+		Args:          args,
+		CreatedAt:     time.Now().UTC().Format("2006-01-02 15:04:05"),
+	}
+	_, err := s.db.NewInsert().Model(rec).Exec(context.Background())
 	return err
 }
 
 // UpsertFragment stores (or replaces) a document fragment by its full key.
 func (s *Store) UpsertFragment(key, blobJSON, hash string) error {
-	_, err := s.db.Exec(
-		`INSERT INTO document_fragments (key, blob_json, hash, updated_at) VALUES (?, ?, ?, datetime('now'))
-		 ON CONFLICT(key) DO UPDATE SET blob_json=excluded.blob_json, hash=excluded.hash, updated_at=excluded.updated_at`,
-		key, blobJSON, hash,
-	)
+	frag := &DocumentFragment{
+		Key:       key,
+		BlobJSON:  blobJSON,
+		Hash:      hash,
+		UpdatedAt: time.Now().UTC().Format("2006-01-02 15:04:05"),
+	}
+	_, err := s.db.NewInsert().Model(frag).
+		On("CONFLICT (key) DO UPDATE SET blob_json = EXCLUDED.blob_json, hash = EXCLUDED.hash, updated_at = EXCLUDED.updated_at").
+		Exec(context.Background())
 	return err
 }
 
 // DeleteFragment removes a document fragment by key.
 func (s *Store) DeleteFragment(key string) error {
-	_, err := s.db.Exec(`DELETE FROM document_fragments WHERE key = ?`, key)
+	_, err := s.db.NewDelete().Model((*DocumentFragment)(nil)).Where("key = ?", key).Exec(context.Background())
 	return err
 }
 
@@ -298,19 +300,19 @@ func (s *Store) DeleteFragment(key string) error {
 // "{docType}:*:{documentID}". Used to clear stale fragments before re-inserting
 // a fresh consistent set (e.g. from startPlaySession).
 func (s *Store) DeleteFragmentsForDocument(docType, documentID string) error {
-	_, err := s.db.Exec(
-		`DELETE FROM document_fragments WHERE key LIKE ? AND key LIKE ?`,
-		docType+":%", "%:"+documentID,
-	)
+	_, err := s.db.NewDelete().Model((*DocumentFragment)(nil)).
+		Where("key LIKE ?", docType+":%").
+		Where("key LIKE ?", "%:"+documentID).
+		Exec(context.Background())
 	return err
 }
 
 // GetFragment returns the stored blob_json for a full fragment key.
 // Returns sql.ErrNoRows if not found.
 func (s *Store) GetFragment(key string) (string, error) {
-	var blob string
-	err := s.db.QueryRow(`SELECT blob_json FROM document_fragments WHERE key = ?`, key).Scan(&blob)
-	return blob, err
+	var frag DocumentFragment
+	err := s.db.NewSelect().Model(&frag).Where("key = ?", key).Scan(context.Background())
+	return frag.BlobJSON, err
 }
 
 // GetFragmentsForDocument returns all stored fragments matching a 2-part requestDocuments
@@ -327,25 +329,18 @@ func (s *Store) GetFragmentsForDocument(requestKey string) (map[string]string, e
 	docType := requestKey[:sep]
 	documentID := requestKey[sep+1:]
 
-	rows, err := s.db.Query(
-		`SELECT key, blob_json FROM document_fragments WHERE key LIKE ? AND key LIKE ?`,
-		docType+":%", "%:"+documentID,
-	)
+	var frags []DocumentFragment
+	err := s.db.NewSelect().Model(&frags).
+		Where("key LIKE ?", docType+":%").
+		Where("key LIKE ?", "%:"+documentID).
+		Scan(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	result := map[string]string{}
-	for rows.Next() {
-		var k, blob string
-		if err := rows.Scan(&k, &blob); err != nil {
-			return nil, err
-		}
-		result[k] = blob
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	result := make(map[string]string, len(frags))
+	for _, f := range frags {
+		result[f.Key] = f.BlobJSON
 	}
 
 	if docType == "EntityCollection" {
@@ -356,8 +351,6 @@ func (s *Store) GetFragmentsForDocument(requestKey string) (map[string]string, e
 }
 
 // filterByEntityList drops entity fragments not listed in the EntityCollection FragmentList.
-// This prevents stale entities from old sessions being served when the authoritative
-// FragmentList has since shrunk (e.g. an entity was deleted and re-created with a new ID).
 func filterByEntityList(frags map[string]string, documentID string) map[string]string {
 	fragListKey := "EntityCollection:FragmentList:" + documentID
 	fragListBlob, ok := frags[fragListKey]

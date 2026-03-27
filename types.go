@@ -1,11 +1,14 @@
 package main
 
+import "github.com/uptrace/bun"
+
 type Command string
 
 type Friend struct {
-	UUID  string
-	Alias string
-	Level int
+	bun.BaseModel `bun:"table:friends"`
+	UUID          string `bun:"uuid,pk"`
+	Alias         string `bun:"alias,notnull"`
+	Level         int    `bun:"level,notnull,default:1"`
 }
 
 const (
