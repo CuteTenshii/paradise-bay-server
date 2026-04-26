@@ -9,7 +9,7 @@ Write-Host ""
 #         If already extracted, skip. If the .appx is missing, tell the user
 #         where to download it.
 # ---------------------------------------------------------------------------
-Write-Host "[1/4] Checking for extracted package ..." -ForegroundColor Yellow
+Write-Host "[1/5] Checking for extracted package ..." -ForegroundColor Yellow
 
 $appxName    = "king.com.ParadiseBay_3.9.0.0_x86__kgqvnymyfvs32.appx"
 $appxPath    = Join-Path $PSScriptRoot $appxName
@@ -45,7 +45,7 @@ Write-Host ""
 #         Scans bundle\data for any file containing "%20" and renames it,
 #         replacing each "%20" with a literal space.
 # ---------------------------------------------------------------------------
-Write-Host "[2/4] Fixing URL-encoded filenames in bundle\data ..." -ForegroundColor Yellow
+Write-Host "[2/5] Fixing URL-encoded filenames in bundle\data ..." -ForegroundColor Yellow
 
 $fixed = 0
 Get-ChildItem -LiteralPath "bundle\data" | Where-Object { $_.Name -like "*%20*" } | ForEach-Object {
@@ -66,7 +66,7 @@ Write-Host ""
 # ---------------------------------------------------------------------------
 # Step 3: Patch game-info.json - replace the live server URL with localhost.
 # ---------------------------------------------------------------------------
-Write-Host "[3/4] Patching game-info.json ..." -ForegroundColor Yellow
+Write-Host "[3/5] Patching game-info.json ..." -ForegroundColor Yellow
 
 $gameInfo = Join-Path $extractDest "game-info.json"
 if (-not (Test-Path -LiteralPath $gameInfo)) {
@@ -89,11 +89,36 @@ if (-not (Test-Path -LiteralPath $gameInfo)) {
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# Step 4: Remove any previously installed version, then register the package
+# Step 4: Patch AppxManifest.xml to add the privateNetworkClientServer
+#         capability, which allows the game to reach localhost.
+# ---------------------------------------------------------------------------
+Write-Host "[4/5] Patching AppxManifest.xml ..." -ForegroundColor Yellow
+
+$manifest = Join-Path $extractDest "AppxManifest.xml"
+if (-not (Test-Path -LiteralPath $manifest)) {
+    Write-Host "  WARNING: AppxManifest.xml not found, skipping patch." -ForegroundColor Red
+} else {
+    $manifestContent = Get-Content -LiteralPath $manifest -Raw
+    $capEntry = '<Capability Name="privateNetworkClientServer" />'
+    if ($manifestContent -match 'privateNetworkClientServer') {
+        Write-Host "  Already patched." -ForegroundColor Gray
+    } elseif ($manifestContent -match '</Capabilities>') {
+        $manifestContent = $manifestContent -replace '</Capabilities>', "    $capEntry`n  </Capabilities>"
+        Set-Content -LiteralPath $manifest -Value $manifestContent -NoNewline
+        Write-Host "  Added privateNetworkClientServer capability." -ForegroundColor Green
+    } else {
+        Write-Host "  WARNING: <Capabilities> block not found in AppxManifest.xml - manual edit may be required." -ForegroundColor Red
+    }
+}
+
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Step 5: Remove any previously installed version, then register the package
 #         directly from this directory (no repacking needed).
 #         Requires Developer Mode in Windows Settings -> For developers.
 # ---------------------------------------------------------------------------
-Write-Host "[4/4] Installing Appx ..." -ForegroundColor Yellow
+Write-Host "[5/5] Installing Appx ..." -ForegroundColor Yellow
 
 $sig = Join-Path $extractDest "AppxSignature.p7x"
 if (Test-Path -LiteralPath $sig) {
