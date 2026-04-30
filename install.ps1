@@ -89,36 +89,11 @@ if (-not (Test-Path -LiteralPath $gameInfo)) {
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# Step 4: Patch AppxManifest.xml to add the privateNetworkClientServer
-#         capability, which allows the game to reach localhost.
-# ---------------------------------------------------------------------------
-Write-Host "[4/5] Patching AppxManifest.xml ..." -ForegroundColor Yellow
-
-$manifest = Join-Path $extractDest "AppxManifest.xml"
-if (-not (Test-Path -LiteralPath $manifest)) {
-    Write-Host "  WARNING: AppxManifest.xml not found, skipping patch." -ForegroundColor Red
-} else {
-    $manifestContent = Get-Content -LiteralPath $manifest -Raw
-    $capEntry = '<Capability Name="privateNetworkClientServer" />'
-    if ($manifestContent -match 'privateNetworkClientServer') {
-        Write-Host "  Already patched." -ForegroundColor Gray
-    } elseif ($manifestContent -match '</Capabilities>') {
-        $manifestContent = $manifestContent -replace '</Capabilities>', "    $capEntry`n  </Capabilities>"
-        Set-Content -LiteralPath $manifest -Value $manifestContent -NoNewline
-        Write-Host "  Added privateNetworkClientServer capability." -ForegroundColor Green
-    } else {
-        Write-Host "  WARNING: <Capabilities> block not found in AppxManifest.xml - manual edit may be required." -ForegroundColor Red
-    }
-}
-
-Write-Host ""
-
-# ---------------------------------------------------------------------------
-# Step 5: Remove any previously installed version, then register the package
+# Step 4: Remove any previously installed version, then register the package
 #         directly from this directory (no repacking needed).
 #         Requires Developer Mode in Windows Settings -> For developers.
 # ---------------------------------------------------------------------------
-Write-Host "[5/5] Installing Appx ..." -ForegroundColor Yellow
+Write-Host "[4/5] Installing Appx ..." -ForegroundColor Yellow
 
 $sig = Join-Path $extractDest "AppxSignature.p7x"
 if (Test-Path -LiteralPath $sig) {
@@ -134,5 +109,15 @@ if ($existing) {
 
 Add-AppxPackage -Register "$extractDest\AppxManifest.xml" -ForceApplicationShutdown
 
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Step 5: Add the app to the loopback exemption list so it can reach localhost.
+# ---------------------------------------------------------------------------
+Write-Host "[5/5] Enabling loopback exemption ..." -ForegroundColor Yellow
+
+CheckNetIsolation LoopbackExempt -a -n="king.com.ParadiseBay_kgqvnymyfvs32"
+
+Write-Host "  Loopback exemption added." -ForegroundColor Green
 Write-Host ""
 Write-Host "Done! Launch 'Paradise Bay' from the Start menu." -ForegroundColor Green
