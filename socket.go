@@ -383,6 +383,14 @@ func handleMessage(conn net.Conn, store *Store) {
 				"transactionId": transactionId,
 				"timelineId":    timelineId,
 			})
+			// Ack the "luas" request itself (matched by req) so the client clears the
+			// pending request and cancels its ResponseTimeoutTimer. Without this the
+			// socket channel times out (~20s) and force-reconnects, replaying
+			// startPlaySession in a loop. The transactionAccepted above is an unsolicited
+			// luaSessionMessage (no req) and cannot clear the pending request on its own.
+			if sendErr == nil {
+				sendErr = sendMessage(zlibWriter, &nextRes, Luas, req, map[string]interface{}{})
+			}
 
 		case ExecuteCommand:
 			// serverOnly facade invocations — `.txn.serverOnly:method()` — arrive as
