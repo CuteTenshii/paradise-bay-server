@@ -9,11 +9,17 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"reflect"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// traceEnabled turns on per-message socket logging (incoming cmd/req/ack and
+// outgoing cmd/res) when PB_TRACE=1. Off by default to keep the log readable;
+// enable it to diagnose connection drops.
+var traceEnabled = os.Getenv("PB_TRACE") == "1"
 
 // friendsInfoBlob returns a serialised FriendsInfoFragment for the given alias/level.
 // The structure mirrors FriendsInfoFragment.init() → {info: getDefaultFriendsInfoView()}.
@@ -99,6 +105,14 @@ func handleMessage(conn net.Conn, store *Store) {
 			req = r.(float64)
 		}
 		msgData := mapData["data"]
+
+		if traceEnabled {
+			ack := "-"
+			if a, ok := mapData["ack"]; ok && a != nil {
+				ack = fmt.Sprintf("%v", a)
+			}
+			log.Printf("<- cmd=%s req=%.0f ack=%s", cmd, req, ack)
+		}
 
 		if cmd == Connect {
 			nextRes = 0
@@ -619,6 +633,9 @@ func sendMessage(w *zlib.Writer, nextRes *int, cmd Command, req float64, data an
 		Response: float64(*nextRes),
 		Session:  "session",
 	}
+	if traceEnabled {
+		log.Printf("-> cmd=%s req=%.0f res=%d", cmd, req, *nextRes)
+	}
 	*nextRes++
 	jsonBytes, err := json.Marshal(message)
 	if err != nil {
@@ -633,6 +650,13 @@ func sendLuaMessage(w *zlib.Writer, nextRes *int, data any) error {
 		Cmd:      LuaSessionMessage,
 		Response: float64(*nextRes),
 		Data:     data,
+	}
+	if traceEnabled {
+		luaType := ""
+		if m, ok := data.(map[string]interface{}); ok {
+			luaType, _ = m["type"].(string)
+		}
+		log.Printf("-> luaSessionMessage res=%d type=%s", *nextRes, luaType)
 	}
 	*nextRes++
 	jsonBytes, err := json.Marshal(message)
