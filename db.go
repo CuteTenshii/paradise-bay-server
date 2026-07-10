@@ -449,7 +449,9 @@ func (s *Store) FragmentBlob(fragmentBlobStoreKey string) string {
 	}
 
 	// For player-derived VIRTUAL types, build the blob dynamically from DB.
-	p, err := s.GetPlayer()
+	// Resolve the specific player named in the key ("...:P[uuid]") when present,
+	// falling back to the first player row for single-player setups.
+	p, err := s.playerFromFragmentKey(fragmentBlobStoreKey)
 	if err != nil {
 		return ""
 	}
@@ -480,6 +482,21 @@ func playerCurrencyBlob(nanopods, gems int64, lifetimeValue float64) string {
 		"lifetimeValueDollars": lifetimeValue,
 	})
 	return string(b)
+}
+
+// playerFromFragmentKey resolves the player referenced by a fragment key of the
+// form "...:P[uuid]". When the key has no player id, or that player is unknown,
+// it falls back to the first player row (single-player setups).
+func (s *Store) playerFromFragmentKey(fragmentBlobStoreKey string) (Player, error) {
+	pStart := strings.Index(fragmentBlobStoreKey, "P[")
+	pEnd := strings.LastIndex(fragmentBlobStoreKey, "]")
+	if pStart != -1 && pEnd > pStart {
+		uuid := fragmentBlobStoreKey[pStart+2 : pEnd]
+		if p, err := s.GetPlayerByCID(uuid); err == nil {
+			return p, nil
+		}
+	}
+	return s.GetPlayer()
 }
 
 func playerInfoBlob(alias string) string {
