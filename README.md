@@ -7,6 +7,11 @@ Fortunately, the servers URLs are just in an array in the `game-info.json` file,
 ![](./screenshot.png)
 The game running on Windows 11 25H2 and being debugged on Visual Studio 2022.
 
+## Known issues
+
+- Some things may not work, not all features have been re-implemented
+- Remote assets (assets that were on King servers) cannot be re-added since the original servers don't exist anymore
+
 ## Usage with the game
 
 ### Downloading the game `.appx`
