@@ -1,2 +1,9 @@
 .idea
 *.db*
+
+# Build artifacts
+/paradise-bay-server
+/paradise-bay-server.exe
+
+# Game package (downloaded separately, not part of the repo)
+*.Appx
