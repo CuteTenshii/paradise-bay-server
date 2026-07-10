@@ -30,6 +30,9 @@ type Player struct {
 	LeaderboardTier      string  `bun:"leaderboard_tier,notnull,default:'Tier0'"`
 	CurrentTcID          *int    `bun:"current_tc_id"`
 	Z2DID                string  `bun:"z2did"`
+	// GameAlias is the display name the player enters in Keani's "Choose Your Name"
+	// dialog (setGameAlias). Empty until the player has picked a name.
+	GameAlias string `bun:"game_alias"`
 }
 
 // VirtualFragment is a pre-computed game data blob keyed by doc_type.
@@ -97,6 +100,7 @@ func OpenDB(path string) (*Store, error) {
 		`ALTER TABLE transactions ADD COLUMN player_uuid TEXT`,
 		`ALTER TABLE players ADD COLUMN current_tc_id INTEGER`,
 		`ALTER TABLE players ADD COLUMN z2did TEXT`,
+		`ALTER TABLE players ADD COLUMN game_alias TEXT`,
 	}
 	for _, m := range migrations {
 		if _, err = db.ExecContext(ctx, m); err != nil {
@@ -283,6 +287,16 @@ func (s *Store) SetPlayerTcID(playerUUID string, tcID int) error {
 	return err
 }
 
+// SetPlayerGameAlias persists the name the player entered in Keani's "Choose Your Name" dialog.
+func (s *Store) SetPlayerGameAlias(playerUUID, gameAlias string) error {
+	_, err := s.db.NewUpdate().
+		Model((*Player)(nil)).
+		Set("game_alias = ?", gameAlias).
+		Where("uuid = ?", playerUUID).
+		Exec(context.Background())
+	return err
+}
+
 // GetPlayerTcID returns the last known transaction context ID for the player, or 0 if unset.
 func (s *Store) GetPlayerTcID(playerUUID string) int {
 	var p Player
@@ -459,7 +473,7 @@ func (s *Store) FragmentBlob(fragmentBlobStoreKey string) string {
 	case "VIRTUAL_PlayerCurrency":
 		return playerCurrencyBlob(p.Nanopods, p.Gems, p.LifetimeValueDollars)
 	case "VIRTUAL_PlayerInfo":
-		return playerInfoBlob(p.Alias)
+		return playerInfoBlob(p.Alias, p.GameAlias)
 	case "VIRTUAL_LeaderboardTier":
 		return leaderboardTierBlob(p.LeaderboardTier)
 	}
@@ -499,11 +513,18 @@ func (s *Store) playerFromFragmentKey(fragmentBlobStoreKey string) (Player, erro
 	return s.GetPlayer()
 }
 
-func playerInfoBlob(alias string) string {
-	b, _ := json.Marshal(map[string]interface{}{
+// playerInfoBlob builds the VIRTUAL_PlayerInfo fragment. bestAlias is the login
+// alias; gameAlias (the name entered in Keani's "Choose Your Name" dialog) is only
+// emitted once set, so the dialog starts empty until the player picks a name.
+func playerInfoBlob(alias, gameAlias string) string {
+	info := map[string]interface{}{
 		"_t":        "VirtualPlayerInfo:v1",
 		"bestAlias": alias,
-	})
+	}
+	if gameAlias != "" {
+		info["gameAlias"] = gameAlias
+	}
+	b, _ := json.Marshal(info)
 	return string(b)
 }
 

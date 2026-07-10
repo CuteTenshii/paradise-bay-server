@@ -26,6 +26,7 @@ const (
 	Luas                     Command = "luas"
 	GetInAppProducts         Command = "getInAppProducts2"
 	ExecuteTransaction       Command = "executeTransaction"
+	ExecuteCommand           Command = "executeCommand"
 )
 
 type ClientMessage struct {

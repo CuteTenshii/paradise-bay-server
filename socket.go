@@ -384,6 +384,52 @@ func handleMessage(conn net.Conn, store *Store) {
 				"timelineId":    timelineId,
 			})
 
+		case ExecuteCommand:
+			// serverOnly facade invocations — `.txn.serverOnly:method()` — arrive as
+			// executeCommand rather than executeTransaction. The client blocks until we
+			// reply with a `commandSucceeded` luaSessionMessage carrying the same
+			// commandId and a JSON-encoded `result`; handle_commandSucceeded then fires
+			// the onTransactionAccepted callback. Keani's "Choose Your Name" dialog
+			// depends on this (getAliases → showUI, setGameAlias → submit); without a
+			// handler it never opens. See issue #3.
+			message, _ := msgData.(map[string]interface{})["message"].(map[string]interface{})
+			if message == nil {
+				log.Println("executeCommand: missing message payload")
+				break
+			}
+
+			var commandID, tcID float64
+			if v, ok := message["commandId"].(float64); ok {
+				commandID = v
+			}
+			if v, ok := message["tcId"].(float64); ok {
+				tcID = v
+			}
+
+			facade, methodName := "", ""
+			var cmdArgs []interface{}
+			if inv, ok := message["invoke"].(map[string]interface{}); ok {
+				methodName, _ = inv["methodName"].(string)
+				if fc, ok := inv["facade"].(map[string]interface{}); ok {
+					facade, _ = fc["c"].(string)
+				}
+				cmdArgs, _ = inv["args"].([]interface{})
+			}
+
+			result := resolveServerCommand(store, playerUUID, methodName, cmdArgs)
+			log.Printf("executeCommand: %s:%s -> result=%s", facade, methodName, result)
+			sendErr = sendLuaMessage(zlibWriter, &nextRes, map[string]interface{}{
+				"type":      "commandSucceeded",
+				"commandId": commandID,
+				"tcId":      tcID,
+				"result":    result,
+			})
+			// Ack the "luas" request (matched by req) so the client cancels its
+			// ResponseTimeoutTimer — same reason as executeTransaction above.
+			if sendErr == nil {
+				sendErr = sendMessage(zlibWriter, &nextRes, Luas, req, map[string]interface{}{})
+			}
+
 		case ValidateOnDemandFiles:
 			// The client sends {fileToSha1: {filename: sha1, ...}} for files in
 			// "verification needed" state (local SHA1 differs from manifest expected SHA1).
@@ -463,6 +509,62 @@ func resolvePlayer(store *Store, msgData any) (Player, error) {
 	newUUID := uuid.New().String()
 	log.Printf("connect: new player %s (z2did=%s) — creating account", newUUID, z2did)
 	return store.CreatePlayer(newUUID, "Guest", z2did)
+}
+
+// resolveServerCommand computes the JSON-string result for a serverOnly facade
+// command (executeCommand). The client runs the returned value through
+// decodeJsonWithSpecialTypeDeserialization, so it must be a JSON string — or the
+// literal "null" to decode as nil. Unknown commands are acked with "null" so no
+// serverOnly flow blocks forever waiting for a response.
+func resolveServerCommand(store *Store, playerUUID, methodName string, args []interface{}) string {
+	switch methodName {
+	case "getAliases":
+		alias, gameAlias := playerAliases(store, playerUUID)
+		aliases := map[string]interface{}{"bestAlias": alias}
+		// Send the stored name only if the player already picked one; otherwise leave
+		// gameAlias out so the client shows an empty field for the player to type into.
+		if gameAlias != "" {
+			aliases["gameAlias"] = gameAlias
+		}
+		b, _ := json.Marshal(aliases)
+		return string(b)
+
+	case "setGameAlias":
+		name := ""
+		if len(args) > 0 {
+			name, _ = args[0].(string)
+		}
+		if name == "" || playerUUID == "" {
+			return "false"
+		}
+		if err := store.SetPlayerGameAlias(playerUUID, name); err != nil {
+			log.Printf("executeCommand setGameAlias: failed to persist name %q: %v", name, err)
+			return "false"
+		}
+		return "true"
+
+	default:
+		return "null"
+	}
+}
+
+// playerAliases returns the connected player's login alias (bestAlias) and the
+// name entered in Keani's "Choose Your Name" dialog (gameAlias), falling back to
+// the first player row (and finally "Guest") so getAliases always resolves.
+func playerAliases(store *Store, playerUUID string) (alias, gameAlias string) {
+	var p Player
+	var err error
+	if playerUUID != "" {
+		p, err = store.GetPlayerByCID(playerUUID)
+	} else {
+		err = sql.ErrNoRows
+	}
+	if err != nil {
+		if p, err = store.GetPlayer(); err != nil {
+			return "Guest", ""
+		}
+	}
+	return p.Alias, p.GameAlias
 }
 
 // extractFileToSha1 pulls the fileToSha1 map out of a connect/reconnect data payload.
